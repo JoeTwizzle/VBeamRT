@@ -27,7 +27,7 @@ internal sealed class Game : IDisposable
     {
         Toolkit.Init(new ToolkitOptions() { ApplicationName = nameof(VBeamRT) });
         VKLoader.Init();
-        _metrics = new Metrics();
+        _metrics = new Metrics(this);
         _gameLoop = new GameLoop();
         _windowHandler = new WindowHandler();
         _mainWindowHandle = _windowHandler.Open();

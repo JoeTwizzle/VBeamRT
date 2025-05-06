@@ -6,16 +6,18 @@ using System.Text;
 using System.Threading.Tasks;
 
 namespace VBeamRT;
-public sealed class Metrics
+internal sealed class Metrics
 {
     public double DeltaTimeFull;
     public float DeltaTime;
     public readonly TimingBuffer TimingBuffer;
     private readonly System.Timers.Timer _timer;
+    private readonly Game _game;
 
-    public Metrics()
+    public Metrics(Game game)
     {
         TimingBuffer = new(30);
+        _game = game;
         _timer = new(TimeSpan.FromSeconds(1));
         _timer.Start();
         _timer.Elapsed += TimerElapsed;
@@ -23,6 +25,8 @@ public sealed class Metrics
 
     private void TimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
     {
-        Toolkit.Window.Logger?.LogInfo($"Frame time Avg: {(TimingBuffer.Average() * 1000):###.###}ms");
+        string log = $"Frame time Avg: {(TimingBuffer.Average() * 1000):###.###}ms";
+        Toolkit.Window.Logger?.LogInfo(log);
+        Toolkit.Window.SetTitle(_game.MainWindowInfo.Handle, log);
     }
 }

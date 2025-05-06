@@ -43,7 +43,7 @@ internal static class SpirvCompiler
 
         ProcessStartInfo psi = new()
         {
-            FileName = "glslangValidator.exe",
+            FileName = "glslangValidator",
             Arguments = $"{stageArg} -o \"{outputFile}\" \"{glslFile}\"",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -80,7 +80,7 @@ internal static class SpirvCompiler
         args += $" -o {outputFile}";
         ProcessStartInfo psi = new()
         {
-            FileName = "slangc.exe",
+            FileName = "slangc",
             Arguments = args,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
