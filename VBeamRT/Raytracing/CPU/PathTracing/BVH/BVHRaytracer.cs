@@ -1,0 +1,346 @@
+using OpenTK.Mathematics;
+using OpenTK.Platform;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using VBeamRT.Raytracing.CPU.Common;
+using VKGraphics;
+
+namespace VBeamRT.Raytracing.CPU.PathTracing.BVH;
+
+class BVHRaytracer : IRenderer
+{
+    const float ToRadians = MathF.PI / 180f;
+    const float ToDegrees = 180f / MathF.PI;
+    const int MaxDepth = 3;
+    readonly Game _game;
+    BVH BVH;
+    GraphicsDevice _gd;
+    ResourceFactory _rf;
+    Swapchain _swapchain;
+    Texture _mainTex;
+    ResourceLayout _blitLayout;
+    ResourceSet _blitSet;
+    CommandList _cl;
+    Pipeline _blitPipeline;
+    Vector4[] _linearAccumulationBuffer;
+    Vector4[] _imageBuffer;
+    GltfScene scene;
+    readonly Triangle[] triangles;
+    readonly Vertex[] vertices;
+
+#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
+    public BVHRaytracer(Game game)
+#pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
+    {
+        _game = game;
+        scene = GltfLoader.Load("Models/Sponza.glb");
+        vertices = [.. scene.Vertices];
+        triangles = [.. scene.Triangles];
+        BVH = new BVH(vertices, triangles);
+    }
+
+    public void Initalize()
+    {
+        SetupRenderer();
+        SetupBlitPass();
+    }
+
+    void SetupRenderer()
+    {
+        _gd = GraphicsDevice.CreateVulkan(new GraphicsDeviceOptions(
+            true, null, false, ResourceBindingModel.Improved, true, false));
+        _rf = _gd.ResourceFactory;
+        _swapchain = _rf.CreateSwapchain(new SwapchainDescription(
+            _game.MainWindowInfo.Handle, 800, 600, null, false));
+    }
+
+    void SetupBlitPass()
+    {
+        //Blit Pass
+        var vertShaderResult = SpirvCompiler.GetSpirvBytes("Shaders/FullscreenTri/fsTriVert.vert");
+        var vertShader = _rf.CreateShader(new ShaderDescription(ShaderStages.Vertex, vertShaderResult, "main"));
+        var fragResult = SpirvCompiler.GetSpirvBytes("Shaders/FullscreenTri/fsTriFrag.frag");
+        var fragShader = _rf.CreateShader(new ShaderDescription(ShaderStages.Fragment, fragResult, "main"));
+
+        //Display layout
+        _blitLayout = _rf.CreateResourceLayout(new ResourceLayoutDescription(
+               new ResourceLayoutElementDescription("_MainSampler", ResourceKind.Sampler, ShaderStages.Fragment),
+               new ResourceLayoutElementDescription("_MainTexture", ResourceKind.TextureReadOnly, ShaderStages.Fragment))
+         );
+
+        var fsTriShaderSet = new ShaderSetDescription(null, [vertShader, fragShader]);
+        _blitPipeline = _rf.CreateGraphicsPipeline(new GraphicsPipelineDescription(BlendStateDescription.SingleOverrideBlend,
+            DepthStencilStateDescription.Disabled, RasterizerStateDescription.CullNone,
+              PrimitiveTopology.TriangleList, fsTriShaderSet, _blitLayout, _swapchain.Framebuffer.OutputDescription));
+
+        _cl = _rf.CreateCommandList();
+    }
+
+    void ResizeGPU(int resX, int resY)
+    {
+        _mainTex?.Dispose();
+        _mainTex = _rf.CreateTexture(new TextureDescription((uint)resX, (uint)resY,
+            1, 1, 1, PixelFormat.R32G32B32A32Float, TextureUsage.Sampled | TextureUsage.Storage, TextureType.Texture2D));
+        _blitSet?.Dispose();
+        _blitSet = _rf.CreateResourceSet(new ResourceSetDescription(_blitLayout, _gd.LinearSampler, _mainTex));
+        _swapchain.Resize((uint)resX, (uint)resY);
+    }
+
+    void ResizeCPU(int resX, int resY)
+    {
+        Console.WriteLine($"Resized to: {resX} by {resY}");
+        _linearAccumulationBuffer = new Vector4[resX * resY];
+        _imageBuffer = new Vector4[resX * resY];
+        _frameCount = 0;
+    }
+
+    public void Update()
+    {
+        Toolkit.Window.GetFramebufferSize(_game.MainWindowInfo.Handle, out var framebufferSize);
+        if (_linearAccumulationBuffer == null || framebufferSize.X * framebufferSize.Y != _linearAccumulationBuffer.Length)
+        {
+            ResizeCPU(framebufferSize.X, framebufferSize.Y);
+        }
+        if (_mainTex == null || _mainTex.Width != framebufferSize.X || _mainTex.Height != framebufferSize.Y)
+        {
+            if (Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) != WindowMode.Hidden)
+            {
+                ResizeGPU(framebufferSize.X, framebufferSize.Y);
+            }
+        }
+        RenderScene(framebufferSize.X, framebufferSize.Y);
+        BlitImage(framebufferSize.X, framebufferSize.Y);
+    }
+
+
+    private void BlitImage(int xPixels, int yPixels)
+    {
+        Toolkit.Window.GetFramebufferSize(_game.MainWindowInfo.Handle, out var fb);
+
+        if (fb.X != _swapchain.Framebuffer.Width || _swapchain.Framebuffer.Height != fb.Y) { return; }
+        Parallel.For(0, _imageBuffer.Length, i =>
+        {
+            var color = ToSrgb(Aces(Unsafe.BitCast<Vector3, Vec3>(_linearAccumulationBuffer[i].Xyz)));
+            _imageBuffer[i] = new Vector4(color.X, color.Y, color.Z, 1f);
+        });
+        _gd.UpdateTexture(_mainTex, _imageBuffer, 0, 0, 0, (uint)xPixels, (uint)yPixels, 1, 0, 0);
+
+        _cl.Begin();
+        _cl.SetPipeline(_blitPipeline);
+        _cl.SetGraphicsResourceSet(0, _blitSet);
+        _cl.SetFramebuffer(_swapchain.Framebuffer);
+        _cl.SetFullViewport(0);
+        _cl.Draw(3);
+        _cl.End();
+        _gd.SubmitCommands(_cl);
+        _gd.SwapBuffers(_swapchain);
+    }
+
+    static Vec3 Aces(Vec3 v)
+    {
+        v *= 0.6f;
+        float a = 2.51f;
+        float b = 0.03f;
+        float c = 2.43f;
+        float d = 0.59f;
+        float e = 0.14f;
+        return Vec3.Clamp(v * (a * v + new Vec3(b)) / (v * (c * v + new Vec3(d)) + new Vec3(e)), Vec3.Zero, Vec3.One);
+    }
+    int _frameCount = 0;
+    void RenderScene(int xPixels, int yPixels)
+    {
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 100, -Vec3.UnitX, Vec3.UnitY);
+
+
+        var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
+            60 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
+        Matrix4x4.Invert(projectionMatrix, out var inverseProjectionMatrix);
+        Matrix4x4.Invert(viewMatrix, out var inverseViewMatrix);
+        _frameCount++;
+        var (dx, rx) = int.DivRem(xPixels, 64);
+        int tilesX = dx + (rx != 0 ? 1 : 0);
+        var (dy, ry) = int.DivRem(yPixels, 64);
+        int tilesY = dy + (ry != 0 ? 1 : 0);
+        Parallel.For(0, tilesX * tilesY, id =>
+        {
+            int tileX = id % tilesX;
+            int tileY = id / tilesX;
+
+            for (int y = tileY * 64; y < (tileY + 1) * 64; y++)
+            {
+                if (y >= yPixels) { continue; }
+                for (int x = tileX * 64; x < (tileX + 1) * 64; x++)
+                {
+                    if (x >= xPixels) { continue; }
+                    var uvCoords = new Vec2(x / (float)xPixels, y / (float)yPixels);
+                    var rayCoords = uvCoords * 2f - Vec2.One;
+                    var ray = Ray.CreateCameraRay(rayCoords, inverseViewMatrix, inverseProjectionMatrix);
+                    var color = TraceRay(ray);
+                    Vec3 mapped = ToSrgb(Aces(color));
+
+                    _linearAccumulationBuffer[x + y * xPixels] += Vector4.Clamp(new Vector4(mapped.X, mapped.Y, mapped.Z, 1), Vector4.Zero, Vector4.One) / _frameCount;
+                    //_imageBuffer[x + y * xPixels] = Vector4.Clamp(new Vector4(mapped.X, mapped.Y, mapped.Z, 1), Vector4.Zero, Vector4.One);
+                }
+            }
+        });
+        Console.WriteLine("Samples: " + _frameCount);
+    }
+    private static readonly ThreadLocal<Xoroshiro128Plus> rng = new(() =>
+    {
+        ulong threadSeed = (ulong)Environment.TickCount ^ (ulong)Environment.CurrentManagedThreadId;
+        return new Xoroshiro128Plus(threadSeed);
+    });
+
+    Vec3 TraceRay(Ray ray)
+    {
+        Vec3 throughput = Vec3.One;
+        Vec3 radiance = Vec3.Zero;
+        bool specularBounce = false;
+
+        for (int bounce = 0; bounce < MaxDepth; bounce++)
+        {
+            if (!BVH.IntersectClosest(ray, out HitInfo hit))
+            {
+                // Environment lighting with physical units
+                Vec3 unitDir = Vec3.Normalize(ray.Direction);
+                float t = 0.5f * (unitDir.Y + 1.0f);
+                Vec3 sky = Vec3.Lerp(new Vec3(0.5f), new Vec3(0.8f), t);
+                radiance += throughput * sky * 0.5f;
+                break;
+            }
+
+
+            var mat = scene.Materials[scene.MaterialIndices[hit.TriangleIndex]];
+            Vec3 albedo;
+            if (mat.AlbedoTextureId >= 0)
+            {
+                albedo = scene.Textures[mat.AlbedoTextureId].Sample(hit.UV).AsVector128().AsVector3();
+            }
+            else
+            {
+                albedo = mat.Albedo;
+            }
+            Vec3 emission = mat.Emission;
+            float roughness = mat.Roughness;
+
+            // Add emission only on first hit or after specular bounce
+            if (bounce == 0 || specularBounce)
+            {
+                radiance += throughput * emission;
+            }
+
+            // Prepare surface information
+            Vec3 hitPoint = ray.GetHitPoint(hit.Distance) + hit.Normal * 0.001f;
+            Vec3 normal = hit.Normal;
+            Vec3 shadingNormal = FaceForward(normal, ray.Direction);
+            Vec3 tangent = CreateOrthonormalBasis(shadingNormal);
+            Vec3 bitangent = Vec3.Cross(shadingNormal, tangent);
+
+            // Sample new direction based on material properties
+            Vec3 worldDir;
+            float pdf;
+            Vec3 brdf;
+
+            if (roughness < 0.1f)  // Specular material
+            {
+                worldDir = Vec3.Reflect(ray.Direction, shadingNormal);
+                pdf = 1.0f;
+                brdf = albedo / Vec3.Dot(shadingNormal, worldDir);
+                specularBounce = true;
+            }
+            else  // Diffuse material
+            {
+                // Cosine-weighted hemisphere sampling
+                Vec2 r = Random2();
+                float phi = 2 * MathF.PI * r.X;
+                float cosTheta = MathF.Sqrt(1 - r.Y);
+                float sinTheta = MathF.Sqrt(r.Y);
+
+                Vec3 localDir = new Vec3(
+                    MathF.Cos(phi) * sinTheta,
+                    MathF.Sin(phi) * sinTheta,
+                    cosTheta
+                );
+
+                worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
+                pdf = cosTheta / MathF.PI;
+                brdf = albedo / MathF.PI;
+                specularBounce = false;
+            }
+
+            // Update throughput with BRDF and PDF
+            float cosTheta2 = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
+            throughput *= brdf * cosTheta2 / pdf;
+
+            // Offset ray origin to prevent self-intersection
+            Vec3 originOffset = hitPoint + shadingNormal * (Vec3.Dot(worldDir, shadingNormal) > 0 ? 1e-4f : -1e-4f);
+            ray = new Ray(originOffset, worldDir);
+
+            // Russian Roulette termination
+            if (bounce > 2)
+            {
+                float p = MathF.Min(0.95f, MathF.Max(throughput.X, MathF.Max(throughput.Y, throughput.Z)));
+                if (RandomFloat() > p) break;
+                throughput /= p;
+            }
+        }
+
+        return radiance;
+    }
+
+    static Vec3 CreateOrthonormalBasis(Vec3 normal)
+    {
+        Vec3 tangent;
+        if (MathF.Abs(normal.X) > MathF.Abs(normal.Y))
+            tangent = Vec3.Normalize(new Vec3(normal.Z, 0, -normal.X));
+        else
+            tangent = Vec3.Normalize(new Vec3(0, -normal.Z, normal.Y));
+        return tangent;
+    }
+
+    static Vec3 FaceForward(Vec3 normal, Vec3 direction)
+    {
+        return Vec3.Dot(normal, direction) < 0 ? normal : -normal;
+    }
+
+    static Vec2 Random2()
+    {
+        return rng.Value.NextVec2();
+    }
+
+    static float RandomFloat()
+    {
+        return rng.Value.NextFloat();
+    }
+
+    static Vec3 ToLinear(Vec3 src)
+    {
+        src.X = float.Pow(src.X, 2.2f);
+        src.Y = float.Pow(src.Y, 2.2f);
+        src.Z = float.Pow(src.Z, 2.2f);
+        return src;
+    }
+
+    static Vec3 ToSrgb(Vec3 src)
+    {
+        src.X = float.Pow(src.X, 1 / 2.2f);
+        src.Y = float.Pow(src.Y, 1 / 2.2f);
+        src.Z = float.Pow(src.Z, 1 / 2.2f);
+        return src;
+    }
+
+
+
+    public void Dispose()
+    {
+        _gd.WaitForIdle();
+        _blitSet.Dispose();
+        _blitPipeline.Dispose();
+        _blitLayout.Dispose();
+        _mainTex.Dispose();
+        _cl.Dispose();
+        _swapchain.Dispose();
+        _gd.Dispose();
+    }
+}

@@ -174,6 +174,7 @@ class SimpleRaytracer : IRenderer
         var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
             60 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
 
+        Matrix4x4.Invert(viewMatrix, out var inverseViewMatrix);
         Matrix4x4.Invert(projectionMatrix, out var invereseProjectionMatrix);
         Parallel.For(0, yPixels, y =>
         {
@@ -181,7 +182,7 @@ class SimpleRaytracer : IRenderer
             {
                 var uvCoords = new Vec2(x / (float)xPixels, y / (float)yPixels);
                 var rayCoords = uvCoords * 2f - Vec2.One;
-                var ray = Ray.CreateCameraRay(rayCoords, viewMatrix, invereseProjectionMatrix);
+                var ray = Ray.CreateCameraRay(rayCoords, inverseViewMatrix, invereseProjectionMatrix);
                 var color = TraceRay(ray, 0);
 
                 Vec3 mapped = ToSrgb(Aces(color));

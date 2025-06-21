@@ -1,3 +1,4 @@
+global using Texture = VKGraphics.Texture;
 using OpenTK.Graphics.Glx;
 using OpenTK.Mathematics;
 using OpenTK.Platform;
@@ -27,7 +28,7 @@ class BlockerRaytracer : IRenderer
     GraphicsDevice _gd;
     ResourceFactory _rf;
     Swapchain _swapchain;
-    Texture _mainTex;
+    VKGraphics.Texture _mainTex;
     ResourceLayout _blitLayout;
     ResourceSet _blitSet;
     CommandList _cl;

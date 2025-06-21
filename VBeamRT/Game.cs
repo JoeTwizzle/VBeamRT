@@ -2,6 +2,7 @@ using OpenTK.Graphics;
 using OpenTK.Platform;
 using OpenTK.Platform.Native;
 using VBeamRT.Raytracing;
+using VBeamRT.Raytracing.CPU.PathTracing.BVH;
 using VBeamRT.Raytracing.CPU.Whitted;
 using VBeamRT.Raytracing.CPU.Whitted.BlockerCache;
 using VBeamRT.Raytracing.CPU.Whitted.Simple;
@@ -33,7 +34,7 @@ internal sealed class Game : IDisposable
         _mainWindowHandle = _windowHandler.Open();
         _mainWindowInfo = _windowHandler.GetInfo(_mainWindowHandle);
         _mainWindowInfo.EventQueue.EventDispatched += MainWindowEventHandler;
-        _renderer = new BlockerRaytracer(this);
+        _renderer = new BVHRaytracer(this);
         Initialize();
         _gameLoop.ShouldRun = true;
         _gameLoop.Run(_metrics, Update);
