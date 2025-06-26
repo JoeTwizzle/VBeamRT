@@ -65,6 +65,227 @@ public sealed partial class BVH
         return currentIndex;
     }
 
+    public bool IntersectAny(Ray ray)
+    {
+        Vec3 invDir = new Vec3(1f) / ray.Direction;
+        Vector3i sign = new Vector3i(
+            ray.Direction.X < 0 ? 1 : 0,
+            ray.Direction.Y < 0 ? 1 : 0,
+            ray.Direction.Z < 0 ? 1 : 0);
+
+        const int MaxStackDepth = 64;
+        Span<int> stack = stackalloc int[MaxStackDepth];
+        int stackPtr = 0;
+        stack[stackPtr++] = 0;  // root node index
+        while (stackPtr > 0)
+        {
+            var node = flatBVH[stack[--stackPtr]];
+
+            // Early exit if ray misses node AABB
+            if (!IntersectAABB(node.Bounds, ray.Origin, sign, invDir, float.PositiveInfinity, out _))
+                continue;
+
+            // Leaf node processing
+            if (node.TriangleCount > 0)
+            {
+                int start = node.TriangleStart;
+                int end = start + node.TriangleCount;
+
+                // Vectorized processing for batches of 4 triangles
+                if (Vector128.IsHardwareAccelerated && (end - start) >= 4)
+                {
+                    const float EPSILON = 1e-6f;
+                    Vector128<float> minDistVec = Vector128.Create(0f);
+                    Vector128<float> maxDistVec = Vector128.Create(float.PositiveInfinity);
+                    Vector128<float> epsilonVec = Vector128.Create(EPSILON);
+                    Vector128<float> oneVec = Vector128.Create(1.0001f);
+                    Vector128<float> zeroVec = Vector128<float>.Zero;
+
+                    Vector128<float> rayDx = Vector128.Create(ray.Direction.X);
+                    Vector128<float> rayDy = Vector128.Create(ray.Direction.Y);
+                    Vector128<float> rayDz = Vector128.Create(ray.Direction.Z);
+                    Vector128<float> rayOx = Vector128.Create(ray.Origin.X);
+                    Vector128<float> rayOy = Vector128.Create(ray.Origin.Y);
+                    Vector128<float> rayOz = Vector128.Create(ray.Origin.Z);
+
+                    for (int i = start; i <= end - 4; i += 4)
+                    {
+                        ref Triangle tri0 = ref triangles[i];
+                        ref Triangle tri1 = ref triangles[i + 1];
+                        ref Triangle tri2 = ref triangles[i + 2];
+                        ref Triangle tri3 = ref triangles[i + 3];
+
+                        // Gather vertex data (v0, v1, v2)
+                        Vector128<float> v0x = Vector128.Create(
+                              vertices[tri0.Index0].Position.X,
+                              vertices[tri1.Index0].Position.X,
+                              vertices[tri2.Index0].Position.X,
+                              vertices[tri3.Index0].Position.X
+                          );
+                        Vector128<float> v0y = Vector128.Create(
+                            vertices[tri0.Index0].Position.Y,
+                            vertices[tri1.Index0].Position.Y,
+                            vertices[tri2.Index0].Position.Y,
+                            vertices[tri3.Index0].Position.Y
+                        );
+                        Vector128<float> v0z = Vector128.Create(
+                            vertices[tri0.Index0].Position.Z,
+                            vertices[tri1.Index0].Position.Z,
+                            vertices[tri2.Index0].Position.Z,
+                            vertices[tri3.Index0].Position.Z
+                        );
+
+                        Vector128<float> v1x = Vector128.Create(
+                            vertices[tri0.Index1].Position.X,
+                            vertices[tri1.Index1].Position.X,
+                            vertices[tri2.Index1].Position.X,
+                            vertices[tri3.Index1].Position.X
+                        );
+                        Vector128<float> v1y = Vector128.Create(
+                            vertices[tri0.Index1].Position.Y,
+                            vertices[tri1.Index1].Position.Y,
+                            vertices[tri2.Index1].Position.Y,
+                            vertices[tri3.Index1].Position.Y
+                        );
+                        Vector128<float> v1z = Vector128.Create(
+                            vertices[tri0.Index1].Position.Z,
+                            vertices[tri1.Index1].Position.Z,
+                            vertices[tri2.Index1].Position.Z,
+                            vertices[tri3.Index1].Position.Z
+                        );
+
+                        Vector128<float> v2x = Vector128.Create(
+                            vertices[tri0.Index2].Position.X,
+                            vertices[tri1.Index2].Position.X,
+                            vertices[tri2.Index2].Position.X,
+                            vertices[tri3.Index2].Position.X
+                        );
+                        Vector128<float> v2y = Vector128.Create(
+                            vertices[tri0.Index2].Position.Y,
+                            vertices[tri1.Index2].Position.Y,
+                            vertices[tri2.Index2].Position.Y,
+                            vertices[tri3.Index2].Position.Y
+                        );
+                        Vector128<float> v2z = Vector128.Create(
+                            vertices[tri0.Index2].Position.Z,
+                            vertices[tri1.Index2].Position.Z,
+                            vertices[tri2.Index2].Position.Z,
+                            vertices[tri3.Index2].Position.Z
+                        );
+
+                        // Compute edge vectors
+                        Vector128<float> edge1x = v1x - v0x;
+                        Vector128<float> edge1y = v1y - v0y;
+                        Vector128<float> edge1z = v1z - v0z;
+                        Vector128<float> edge2x = v2x - v0x;
+                        Vector128<float> edge2y = v2y - v0y;
+                        Vector128<float> edge2z = v2z - v0z;
+
+                        // pVec = cross(ray.Direction, edge2)
+                        Vector128<float> pVecx = rayDy * edge2z - rayDz * edge2y;
+                        Vector128<float> pVecy = rayDz * edge2x - rayDx * edge2z;
+                        Vector128<float> pVecz = rayDx * edge2y - rayDy * edge2x;
+
+                        // determinant = dot(edge1, pVec)
+                        Vector128<float> det = edge1x * pVecx + edge1y * pVecy + edge1z * pVecz;
+
+                        // Check backface and parallel
+                        Vector128<int> parallelMask = Vector128.LessThanOrEqual(
+                            Vector128.Abs(det), epsilonVec).As<float, int>();
+
+                        // Compute inverse determinant
+                        Vector128<float> invDet = Vector128.ConditionalSelect(
+                            parallelMask.AsSingle(),
+                            zeroVec,
+                            Vector128<float>.One / det
+                        );
+
+                        // tVec = ray.Origin - v0
+                        Vector128<float> tVecx = rayOx - v0x;
+                        Vector128<float> tVecy = rayOy - v0y;
+                        Vector128<float> tVecz = rayOz - v0z;
+
+                        // baryU = dot(tVec, pVec) * invDet
+                        Vector128<float> baryU = (tVecx * pVecx + tVecy * pVecy + tVecz * pVecz) * invDet;
+
+                        // Check u bounds
+                        Vector128<int> uValidMask = Vector128.GreaterThanOrEqual(baryU, zeroVec).As<float, int>() &
+                                                   Vector128.LessThanOrEqual(baryU, Vector128<float>.One).As<float, int>();
+
+                        // qVec = cross(tVec, edge1)
+                        Vector128<float> qVecx = tVecy * edge1z - tVecz * edge1y;
+                        Vector128<float> qVecy = tVecz * edge1x - tVecx * edge1z;
+                        Vector128<float> qVecz = tVecx * edge1y - tVecy * edge1x;
+
+                        // baryV = dot(ray.Direction, qVec) * invDet
+                        Vector128<float> baryV = (rayDx * qVecx + rayDy * qVecy + rayDz * qVecz) * invDet;
+
+                        // Check v bounds
+                        Vector128<float> sumUV = baryU + baryV;
+                        Vector128<int> vValidMask = Vector128.GreaterThanOrEqual(baryV, zeroVec).As<float, int>() &
+                                                   Vector128.LessThanOrEqual(sumUV, oneVec).As<float, int>();
+
+                        // hitDistance = dot(edge2, qVec) * invDet
+                        Vector128<float> hitDistance = (edge2x * qVecx + edge2y * qVecy + edge2z * qVecz) * invDet;
+
+                        // Check distance validity
+                        Vector128<int> distRangeMask = Vector128.GreaterThan(hitDistance, minDistVec).As<float, int>() &
+                                                      Vector128.LessThan(hitDistance, maxDistVec).As<float, int>();
+
+                        // Final hit mask
+                        Vector128<int> hitMask = ~parallelMask & uValidMask & vValidMask & distRangeMask;
+
+                        // Early exit if any hit detected
+                        if (!hitMask.Equals(Vector128<int>.Zero))
+                            return true;
+                    }
+                }
+
+                // Scalar processing for remaining triangles
+                for (int i = start; i < end; i++)
+                {
+                    if (RayIntersectsTriangle(ray, triangles[i], out float t, out _, out _, out _))
+                    {
+                        return true;
+                    }
+                }
+            }
+            else
+            {
+                // Internal node processing
+                int left = node.LeftChild;
+                int right = node.RightChild;
+
+                IntersectAABB2(flatBVH[left].Bounds, flatBVH[right].Bounds,
+                    ray.Origin, sign, invDir, float.PositiveInfinity,
+                    out bool hitLeft, out float tminLeft,
+                    out bool hitRight, out float tminRight);
+
+                if (hitLeft && hitRight)
+                {
+                    // Push farther child first, closer child last
+                    if (tminLeft > tminRight)
+                    {
+                        stack[stackPtr++] = left;
+                        stack[stackPtr++] = right;
+                    }
+                    else
+                    {
+                        stack[stackPtr++] = right;
+                        stack[stackPtr++] = left;
+                    }
+                }
+                else
+                {
+                    if (hitLeft) stack[stackPtr++] = left;
+                    if (hitRight) stack[stackPtr++] = right;
+                }
+            }
+        }
+
+        return false;
+    }
+
     public bool IntersectClosest(Ray ray, out HitInfo hitInfo)
     {
         hitInfo = new HitInfo { Distance = float.PositiveInfinity, PrimIndex = -1, BoxTests = 0, TriTests = 0 };
