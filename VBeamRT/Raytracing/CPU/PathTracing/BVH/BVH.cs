@@ -20,12 +20,15 @@ public struct Vertex
 public struct Triangle
 {
     public int Index0, Index1, Index2;
+    public int PrimIndex;
 }
 
 public struct HitInfo
 {
     public float Distance;       // t along ray
-    public int TriangleIndex;    // hit triangle index
+    public int PrimIndex;    // hit triangle index
+    public int BoxTests;    // hit triangle index
+    public int TriTests;    // hit triangle index
     public float BarycentricU;   // u barycentric coord
     public float BarycentricV;   // v barycentric coord
     public Vec3 Normal;       // interpolated normal
@@ -143,8 +146,11 @@ public sealed partial class BVH
         flatBVH = [.. list];
     }
 
-    private const int BinCount = 8;
+    private const int BinCount = 16;  // Increased for better SAH quality
+    private const int LeafThreshold = 8;  // Increased leaf size
     private const int MaxDepth = 64;
+    private const float TraversalCost = 1.0f;  // Explicit traversal cost
+    private const float IntersectionCost = 2.0f;  // Explicit intersection cost
 
     struct BinInfo
     {
@@ -172,14 +178,34 @@ public sealed partial class BVH
     private BVHNode Build(int start, int count, int depth = 0)
     {
         AABB bounds = ComputeBounds(start, count);
-        float leafCost = count * bounds.SurfaceArea();
 
-        if (count <= 4 || depth > MaxDepth)  // Slightly bigger leaf threshold for faster build
+        // Leaf creation conditions
+        if (count <= LeafThreshold || depth >= MaxDepth)
         {
             return MakeLeaf(start, count, bounds);
         }
 
-        if (!TryFindBestSplit(start, count, bounds, out int axis, out int splitBin, out int mid))
+        // First try SAH split
+        if (TryFindBestSplit(start, count, bounds, out int axis, out int splitBin, out int mid))
+        {
+            return new BVHNode
+            {
+                Bounds = bounds,
+                Left = Build(start, mid - start, depth + 1),
+                Right = Build(mid, start + count - mid, depth + 1)
+            };
+        }
+
+        // SAH failed - try spatial median fallback
+        Vec3 extent = bounds.Max - bounds.Min;
+        axis = 0;
+        if (extent.Y > extent.X) axis = 1;
+        if (extent.Z > extent[axis]) axis = 2;
+        float splitPos = (bounds.Min[axis] + bounds.Max[axis]) * 0.5f;
+        mid = PartitionTriangles(start, count, axis, splitPos);
+
+        // Final fallback to leaf if needed
+        if (mid == start || mid == start + count)
         {
             return MakeLeaf(start, count, bounds);
         }
@@ -198,13 +224,14 @@ public sealed partial class BVH
         bestBin = -1;
         mid = 0;
 
-        // Precompute centroid bounds and centroids once per triangle
+        // Precompute centroid bounds
         AABB centroidBounds = ComputeCentroidBounds(start, count);
         Vec3 extent = centroidBounds.Max - centroidBounds.Min;
 
+        // Degenerate centroid bounds check
         if (extent.X < 1e-5f && extent.Y < 1e-5f && extent.Z < 1e-5f)
         {
-            return false; // No spatial extent - can't split
+            return false;
         }
 
         float bestCost = float.PositiveInfinity;
@@ -213,31 +240,23 @@ public sealed partial class BVH
         Span<int> leftCounts = stackalloc int[BinCount - 1];
         Span<AABB> rightBounds = stackalloc AABB[BinCount - 1];
         Span<int> rightCounts = stackalloc int[BinCount - 1];
+
         for (int axis = 0; axis < 3; axis++)
         {
-            if (extent[axis] < 1e-5f)
-            {
-                continue;
-            }
+            if (extent[axis] < 1e-5f) continue;
 
             float binScale = BinCount / extent[axis];
+            for (int i = 0; i < BinCount; i++) bins[i].Reset();
 
-            for (int i = 0; i < BinCount; i++)
-            {
-                bins[i].Reset();
-            }
-
-            // Bin triangles by centroid position along axis
+            // Bin triangles
             for (int i = start; i < start + count; i++)
             {
                 Vec3 centroid = Centroid(vertices, triangles[i]);
                 int binIndex = Math.Clamp((int)((centroid[axis] - centroidBounds.Min[axis]) * binScale), 0, BinCount - 1);
-                AABB triBounds = AABB.FromTriangle(vertices, triangles[i]);
-                bins[binIndex].Add(triBounds);
+                bins[binIndex].Add(AABB.FromTriangle(vertices, triangles[i]));
             }
 
-            // Prefix sum for left bounds and counts
-
+            // Prefix sums (left side)
             AABB leftBound = new(new Vec3(float.PositiveInfinity), new Vec3(float.NegativeInfinity));
             int leftCount = 0;
             for (int i = 0; i < BinCount - 1; i++)
@@ -251,9 +270,8 @@ public sealed partial class BVH
                 leftCounts[i] = leftCount;
             }
 
-            // Suffix sum for right bounds and counts
-           
-            AABB rightBound = new AABB(new Vec3(float.PositiveInfinity), new Vec3(float.NegativeInfinity));
+            // Suffix sums (right side)
+            AABB rightBound = new(new Vec3(float.PositiveInfinity), new Vec3(float.NegativeInfinity));
             int rightCount = 0;
             for (int i = BinCount - 1; i > 0; i--)
             {
@@ -271,8 +289,11 @@ public sealed partial class BVH
             {
                 if (leftCounts[i] == 0 || rightCounts[i] == 0) continue;
 
-                float cost = 0.125f +  // traversal cost
-                             (leftCounts[i] * leftBounds[i].SurfaceArea() + rightCounts[i] * rightBounds[i].SurfaceArea()) / bounds.SurfaceArea();
+                // Updated SAH cost with explicit costs
+                float cost = TraversalCost + IntersectionCost *
+                    (leftCounts[i] * leftBounds[i].SurfaceArea() +
+                     rightCounts[i] * rightBounds[i].SurfaceArea()) /
+                    bounds.SurfaceArea();
 
                 if (cost < bestCost)
                 {
@@ -283,17 +304,17 @@ public sealed partial class BVH
             }
         }
 
-        if (bestAxis == -1)
-            return false;
+        if (bestAxis == -1) return false;
 
- 
-        if (bestCost >= count) 
-            return false;
+        // Compare against leaf cost
+        float leafCost = IntersectionCost * count;
+        if (bestCost >= leafCost) return false;
 
+        // Calculate split position
         float splitPos = centroidBounds.Min[bestAxis] + (bestBin + 1) * (extent[bestAxis] / BinCount);
         mid = PartitionTriangles(start, count, bestAxis, splitPos);
 
-        // Avoid degenerate splits - fallback if necessary
+        // Validate split quality
         if (mid == start || mid == start + count)
         {
             return false;
@@ -301,6 +322,10 @@ public sealed partial class BVH
 
         return true;
     }
+
+    // Existing helper methods (ComputeBounds, ComputeCentroidBounds, 
+    // MakeLeaf, PartitionTriangles, Centroid) remain unchanged
+
 
     private AABB ComputeBounds(int start, int count)
     {

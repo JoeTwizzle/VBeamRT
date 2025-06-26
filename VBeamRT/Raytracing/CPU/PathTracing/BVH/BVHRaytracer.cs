@@ -12,7 +12,7 @@ class BVHRaytracer : IRenderer
 {
     const float ToRadians = MathF.PI / 180f;
     const float ToDegrees = 180f / MathF.PI;
-    const int MaxDepth = 3;
+    const int MaxDepth = 128;
     readonly Game _game;
     BVH BVH;
     GraphicsDevice _gd;
@@ -23,7 +23,7 @@ class BVHRaytracer : IRenderer
     ResourceSet _blitSet;
     CommandList _cl;
     Pipeline _blitPipeline;
-    Vector4[] _linearAccumulationBuffer;
+    Vec3[] _linearAccumulationBuffer;
     Vector4[] _imageBuffer;
     GltfScene scene;
     readonly Triangle[] triangles;
@@ -34,7 +34,7 @@ class BVHRaytracer : IRenderer
 #pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
     {
         _game = game;
-        scene = GltfLoader.Load("Models/Sponza.glb");
+        scene = GltfLoader.Load("Models/Beta map split.glb");
         vertices = [.. scene.Vertices];
         triangles = [.. scene.Triangles];
         BVH = new BVH(vertices, triangles);
@@ -90,7 +90,7 @@ class BVHRaytracer : IRenderer
     void ResizeCPU(int resX, int resY)
     {
         Console.WriteLine($"Resized to: {resX} by {resY}");
-        _linearAccumulationBuffer = new Vector4[resX * resY];
+        _linearAccumulationBuffer = new Vec3[resX * resY];
         _imageBuffer = new Vector4[resX * resY];
         _frameCount = 0;
     }
@@ -121,7 +121,8 @@ class BVHRaytracer : IRenderer
         if (fb.X != _swapchain.Framebuffer.Width || _swapchain.Framebuffer.Height != fb.Y) { return; }
         Parallel.For(0, _imageBuffer.Length, i =>
         {
-            var color = ToSrgb(Aces(Unsafe.BitCast<Vector3, Vec3>(_linearAccumulationBuffer[i].Xyz)));
+            var colorD = _linearAccumulationBuffer[i];
+            var color = ToSrgb(Aces(new Vec3((float)colorD.X, (float)colorD.Y, (float)colorD.Z)));
             _imageBuffer[i] = new Vector4(color.X, color.Y, color.Z, 1f);
         });
         _gd.UpdateTexture(_mainTex, _imageBuffer, 0, 0, 0, (uint)xPixels, (uint)yPixels, 1, 0, 0);
@@ -150,7 +151,7 @@ class BVHRaytracer : IRenderer
     int _frameCount = 0;
     void RenderScene(int xPixels, int yPixels)
     {
-        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 100, -Vec3.UnitX, Vec3.UnitY);
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 80, Vec3.UnitX, Vec3.UnitY);
 
 
         var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
@@ -163,6 +164,7 @@ class BVHRaytracer : IRenderer
         var (dy, ry) = int.DivRem(yPixels, 64);
         int tilesY = dy + (ry != 0 ? 1 : 0);
         Parallel.For(0, tilesX * tilesY, id =>
+        //for (int id = 0; id < tilesX * tilesY; id++)
         {
             int tileX = id % tilesX;
             int tileY = id / tilesX;
@@ -176,117 +178,278 @@ class BVHRaytracer : IRenderer
                     var uvCoords = new Vec2(x / (float)xPixels, y / (float)yPixels);
                     var rayCoords = uvCoords * 2f - Vec2.One;
                     var ray = Ray.CreateCameraRay(rayCoords, inverseViewMatrix, inverseProjectionMatrix);
-                    var color = TraceRay(ray);
-                    Vec3 mapped = ToSrgb(Aces(color));
+                    Vec3 current = TraceRay(ray);
+                    Vec3 prev = _linearAccumulationBuffer[x + y * xPixels];
 
-                    _linearAccumulationBuffer[x + y * xPixels] += Vector4.Clamp(new Vector4(mapped.X, mapped.Y, mapped.Z, 1), Vector4.Zero, Vector4.One) / _frameCount;
-                    //_imageBuffer[x + y * xPixels] = Vector4.Clamp(new Vector4(mapped.X, mapped.Y, mapped.Z, 1), Vector4.Zero, Vector4.One);
+                    _linearAccumulationBuffer[x + y * xPixels] = Vec3.Lerp(prev, current, 1f / _frameCount);
+                    //_imageBuffer[x + y * xPixels] = Vector4.Clamp(new Vector4(color.X, color.Y, color.Z, 1), Vector4.Zero, Vector4.One);
                 }
             }
         });
+        //}
         Console.WriteLine("Samples: " + _frameCount);
     }
-    private static readonly ThreadLocal<Xoroshiro128Plus> rng = new(() =>
+    private static readonly ThreadLocal<PCG32> rng = new(() =>
     {
         ulong threadSeed = (ulong)Environment.TickCount ^ (ulong)Environment.CurrentManagedThreadId;
-        return new Xoroshiro128Plus(threadSeed);
+        return new PCG32(threadSeed);
     });
 
     Vec3 TraceRay(Ray ray)
     {
         Vec3 throughput = Vec3.One;
         Vec3 radiance = Vec3.Zero;
-        bool specularBounce = false;
+        bool specularBounce = true; // Start as true to capture emissive surfaces
+        int triTests = 0;
+        int boxTests = 0;
+
 
         for (int bounce = 0; bounce < MaxDepth; bounce++)
         {
             if (!BVH.IntersectClosest(ray, out HitInfo hit))
             {
-                // Environment lighting with physical units
+                // HDR environment mapping with physical units
                 Vec3 unitDir = Vec3.Normalize(ray.Direction);
                 float t = 0.5f * (unitDir.Y + 1.0f);
-                Vec3 sky = Vec3.Lerp(new Vec3(0.5f), new Vec3(0.8f), t);
-                radiance += throughput * sky * 0.5f;
+
+                // Sun disk approximation
+                float sun = Math.Clamp(Vec3.Dot(unitDir, ToLinear(new Vec3(0.35f, 0.9f, 0.2f))), 0, 1);
+                sun = MathF.Pow(sun, 512) * 20f;
+
+                // Improved sky model
+                Vec3 sky = Vec3.Lerp(
+                    ToLinear(new Vec3(0.4f, 0.5f, 0.9f)) * 0.2f,
+                    ToLinear(new Vec3(0.8f, 0.9f, 1.0f)) * 1.5f,
+                    t) + new Vec3(sun, sun * 0.9f, sun * 0.6f);
+
+                //radiance += throughput * sky;
+                triTests += hit.TriTests;
+                boxTests += hit.BoxTests;
                 break;
             }
+            triTests += hit.TriTests;
+            boxTests += hit.BoxTests;
 
+            var prim = scene.Primitives[hit.PrimIndex];
+            var mat = scene.Materials[prim.MaterialIndex];
+            Vec3 albedo = mat.AlbedoTextureId >= 0 ?
+              scene.Images[scene.Textures[mat.AlbedoTextureId]].Sample(hit.UV).AsVector3() :
+                mat.Albedo;
 
-            var mat = scene.Materials[scene.MaterialIndices[hit.TriangleIndex]];
-            Vec3 albedo;
-            if (mat.AlbedoTextureId >= 0)
+            // Normal mapping
+            Vec3 normal = hit.Normal;
+            Vec3 tangent;
+            Vec3 bitangent;
+            if (mat.NormalTextureId >= 0 && mat.NormalTextureId < scene.Textures.Count)
             {
-                albedo = scene.Textures[mat.AlbedoTextureId].Sample(hit.UV).AsVector128().AsVector3();
+                tangent = CreateOrthonormalBasis(normal);
+                bitangent = Vec3.Cross(normal, tangent);
+                Vec3 texNormal = scene.Images[scene.Textures[mat.NormalTextureId]].Sample(hit.UV).AsVector3() * 2 - Vec3.One;
+                normal = Vec3.Normalize(
+                    tangent * texNormal.X +
+                    bitangent * texNormal.Y +
+                    normal * texNormal.Z);
             }
-            else
-            {
-                albedo = mat.Albedo;
-            }
-            Vec3 emission = mat.Emission;
-            float roughness = mat.Roughness;
 
-            // Add emission only on first hit or after specular bounce
-            if (bounce == 0 || specularBounce)
+            // Add emission with multiple importance sampling
+            //if (bounce == 0 || specularBounce)
             {
+                Vec3 emission;
+                if (mat.EmissionTextureId >= 0)
+                {
+                    emission = scene.Images[scene.Textures[mat.EmissionTextureId]].Sample(hit.UV).AsVector3()*10;
+                }
+                else
+                {
+                    emission = mat.Emission;
+                }
+
                 radiance += throughput * emission;
             }
 
             // Prepare surface information
-            Vec3 hitPoint = ray.GetHitPoint(hit.Distance) + hit.Normal * 0.001f;
-            Vec3 normal = hit.Normal;
+            Vec3 hitPoint = ray.GetHitPoint(hit.Distance) + normal * 0.001f;
             Vec3 shadingNormal = FaceForward(normal, ray.Direction);
-            Vec3 tangent = CreateOrthonormalBasis(shadingNormal);
-            Vec3 bitangent = Vec3.Cross(shadingNormal, tangent);
+            tangent = CreateOrthonormalBasis(shadingNormal);
+            bitangent = Vec3.Cross(shadingNormal, tangent);
+
+            // Material properties
+            float roughness = float.Max(mat.Roughness, 0.05f);
+            float metallic = mat.Metallic;
 
             // Sample new direction based on material properties
             Vec3 worldDir;
             float pdf;
             Vec3 brdf;
 
-            if (roughness < 0.1f)  // Specular material
+            // Direct light sampling (Next Event Estimation)
+            //if (bounce < 3 && roughness > 0.1f && scene.Lights.Count > 0)
+            //{
+            //    int lightIdx = (int)(RandomFloat() * scene.Lights.Count);
+            //    var light = scene.Lights[lightIdx];
+
+            //    (Vec3 lightPoint, Vec3 lightNormal, float lightPdf) = light.Sample(hitPoint);
+            //    Vec3 toLight = lightPoint - hitPoint;
+            //    float distSq = toLight.LengthSquared();
+            //    float dist = MathF.Sqrt(distSq);
+            //    Vec3 lightDir = toLight / dist;
+
+            //    float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, lightDir));
+            //    float LdotN = Math.Max(0, Vec3.Dot(lightNormal, -lightDir));
+
+            //    if (NdotL > 0 && LdotN > 0)
+            //    {
+            //        Ray shadowRay = new Ray(hitPoint, lightDir, 0.001f, dist - 0.002f);
+            //        if (!BVH.IntersectAny(shadowRay))
+            //        {
+            //            // BRDF evaluation
+            //            Vec3 halfVec = Vec3.Normalize(-ray.Direction + lightDir);
+            //            float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
+            //            float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+
+            //            // Disney BRDF approximation
+            //            Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
+            //            Vec3 F = FresnelSchlick(NdotV, F0);
+            //            float D = DistributionGGX(NdotH, roughness);
+            //            float G = GeometrySmith(NdotV, NdotL, roughness);
+            //            Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
+
+            //            Vec3 kS = F;
+            //            Vec3 kD = (Vec3.One - kS) * (1 - metallic);
+            //            Vec3 diffuse = kD * albedo / MathF.PI;
+
+            //            Vec3 brdfVal = diffuse + specular;
+            //            float cosTheta = Math.Max(NdotL, 0.001f);
+
+            //            // Light contribution
+            //            Vec3 lightContrib = light.Emission * brdfVal * cosTheta * LdotN / (distSq * lightPdf);
+            //            radiance += throughput * lightContrib;
+            //        }
+            //    }
+            //}
+
+            // BRDF Importance Sampling
+            if (roughness < 0.1f && metallic > 0.7f)  // Specular material
             {
-                worldDir = Vec3.Reflect(ray.Direction, shadingNormal);
-                pdf = 1.0f;
-                brdf = albedo / Vec3.Dot(shadingNormal, worldDir);
+                // GGX importance sampling for specular
+                Vec2 r = Random2();
+                Vec3 halfVector = SampleGGX(r.X, r.Y, roughness, shadingNormal, tangent, bitangent);
+                worldDir = Vec3.Reflect(ray.Direction, halfVector);
+
+                // Calculate PDF and BRDF
+                float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+                float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
+                float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVector));
+
+                Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
+                Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVector, -ray.Direction)), F0);
+                float D = DistributionGGX(NdotH, roughness);
+                pdf = (D * NdotH) / (4 * Math.Max(1e-8f, Vec3.Dot(-ray.Direction, halfVector)));
+                brdf = F * D / (4 * NdotV * NdotL + 1e-8f);
+
                 specularBounce = true;
             }
-            else  // Diffuse material
+            else  // Diffuse or glossy material
             {
-                // Cosine-weighted hemisphere sampling
-                Vec2 r = Random2();
-                float phi = 2 * MathF.PI * r.X;
-                float cosTheta = MathF.Sqrt(1 - r.Y);
-                float sinTheta = MathF.Sqrt(r.Y);
+                float r1 = RandomFloat();
+                float r2 = RandomFloat();
+                // Precomputed cosine-weighted sampling
+                float cosTheta = float.Sqrt(1 - r2);
+                float sinTheta = float.Sqrt(r2);
+                float phi = 2 * float.Pi * r1;
 
+                // Local space direction
                 Vec3 localDir = new Vec3(
                     MathF.Cos(phi) * sinTheta,
                     MathF.Sin(phi) * sinTheta,
                     cosTheta
                 );
 
+                // Transform to world space
                 worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
+
+                // Compute PDF for cosine-weighted hemisphere
                 pdf = cosTheta / MathF.PI;
-                brdf = albedo / MathF.PI;
+
+                // Disney BRDF with metallic and roughness
+                float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+                float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
+                Vec3 halfVec = Vec3.Normalize(-ray.Direction + worldDir);
+                float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
+
+                Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
+                Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
+                float D = DistributionGGX(NdotH, roughness);
+                float G = GeometrySmith(NdotV, NdotL, roughness);
+
+                Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
+                Vec3 kS = F;
+                Vec3 kD = (Vec3.One - kS) * (1 - metallic);
+                Vec3 diffuse = kD * albedo / MathF.PI;
+
+                brdf = diffuse + specular;
                 specularBounce = false;
             }
 
             // Update throughput with BRDF and PDF
-            float cosTheta2 = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
-            throughput *= brdf * cosTheta2 / pdf;
+            float cosThetaOut = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
+            throughput *= brdf * cosThetaOut / pdf;
 
-            // Offset ray origin to prevent self-intersection
-            Vec3 originOffset = hitPoint + shadingNormal * (Vec3.Dot(worldDir, shadingNormal) > 0 ? 1e-4f : -1e-4f);
-            ray = new Ray(originOffset, worldDir);
+            // Update ray for next bounce
+            ray = new Ray(hitPoint, worldDir);
 
-            // Russian Roulette termination
+            // Russian Roulette termination with energy preservation
             if (bounce > 2)
             {
-                float p = MathF.Min(0.95f, MathF.Max(throughput.X, MathF.Max(throughput.Y, throughput.Z)));
-                if (RandomFloat() > p) break;
-                throughput /= p;
+                float q = Math.Max(0.05f, 1 - MathF.Max(throughput.X, MathF.Max(throughput.Y, throughput.Z)));
+                if (RandomFloat() < q) break;
+                throughput /= (1 - q);
             }
         }
 
         return radiance;
+    }
+
+    // Helper functions
+    float DistributionGGX(float NdotH, float roughness)
+    {
+        float a = roughness * roughness;
+        float a2 = a * a;
+        float denom = NdotH * NdotH * (a2 - 1) + 1;
+        return a2 / (MathF.PI * denom * denom);
+    }
+
+    float GeometrySchlickGGX(float NdotV, float roughness)
+    {
+        float r = (roughness + 1);
+        float k = (r * r) / 8;
+        return NdotV / (NdotV * (1 - k) + k);
+    }
+
+    float GeometrySmith(float NdotV, float NdotL, float roughness)
+    {
+        return GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
+    }
+
+    Vec3 FresnelSchlick(float cosTheta, Vec3 F0)
+    {
+        return F0 + (Vec3.One - F0) * MathF.Pow(1 - cosTheta, 5);
+    }
+
+    Vec3 SampleGGX(float u1, float u2, float roughness, Vec3 normal, Vec3 tangent, Vec3 bitangent)
+    {
+        float a = roughness * roughness;
+        float phi = 2 * MathF.PI * u1;
+        float cosTheta = MathF.Sqrt((1 - u2) / (1 + (a * a - 1) * u2));
+        float sinTheta = MathF.Sqrt(1 - cosTheta * cosTheta);
+
+        Vec3 halfVector = new Vec3(
+            MathF.Cos(phi) * sinTheta,
+            MathF.Sin(phi) * sinTheta,
+            cosTheta
+        );
+
+        return halfVector.X * tangent + halfVector.Y * bitangent + halfVector.Z * normal;
     }
 
     static Vec3 CreateOrthonormalBasis(Vec3 normal)

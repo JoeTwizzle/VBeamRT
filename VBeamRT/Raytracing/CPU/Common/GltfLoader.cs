@@ -16,13 +16,13 @@ public sealed class AnimationChannel
     // Vec3 or Quaternion
     public Vector4[] Values;
 }
-public sealed class Texture
+public sealed class Image
 {
     public int Width { get; }
     public int Height { get; }
     private readonly Vec4[] _data; // RGB data
 
-    public Texture(int width, int height)
+    public Image(int width, int height)
     {
         Width = width;
         Height = height;
@@ -30,10 +30,10 @@ public sealed class Texture
     }
 
     public void SetPixel(int x, int y, Vec4 color) => _data[y * Width + x] = color;
-    public static Texture LoadFromBytes(byte[] data)
+    public static Image LoadFromBytes(byte[] data)
     {
-        using var image = Image.Load<Rgba32>(data);
-        var texture = new Texture(image.Width, image.Height);
+        using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(data);
+        var texture = new Image(image.Width, image.Height);
         // Apply gamma correction to linear RGB
         image.ProcessPixelRows(accessor =>
         {
@@ -61,8 +61,8 @@ public sealed class Texture
         float v = Math.Clamp(uv.Y, 0, 1);
 
         // Convert to pixel coordinates with safety margins
-        u = u * (Width - 1e-5f);
-        v = (1 - v) * (Height - 1e-5f);  // Flip V coordinate
+        u *= (Width - 1);
+        v *= (Height - 1);
 
         int x0 = (int)u;
         int y0 = (int)v;
@@ -107,6 +107,7 @@ public struct Material
     public float IOR; // Index of Refraction
     public float Transmission;
     public int AlbedoTextureId;
+    public int EmissionTextureId;
     public int NormalTextureId;
     public int MetallicRoughnessTextureId;
 }
@@ -128,13 +129,24 @@ public enum LightType
 }
 public sealed class GltfScene
 {
+    public List<PrimitiveData> Primitives = [];
     public List<Vertex> Vertices = [];
     public List<Triangle> Triangles = [];
     public List<Material> Materials = [];
     public List<Light> Lights = [];
-    public List<int> MaterialIndices = [];
     public List<AnimationChannel> Animations = [];
-    public List<Texture> Textures = [];
+    public List<Image> Images = [];
+    public List<int> Textures = [];
+}
+
+public struct PrimitiveData
+{
+    public int MaterialIndex;
+
+    public PrimitiveData(int materialIndex)
+    {
+        MaterialIndex = materialIndex;
+    }
 }
 public static class GltfLoader
 {
@@ -234,6 +246,7 @@ public static class GltfLoader
                 Transmission = 0.0f,
                 AlbedoTextureId = -1,
                 NormalTextureId = -1,
+                EmissionTextureId = -1,
                 MetallicRoughnessTextureId = -1
             };
 
@@ -260,16 +273,16 @@ public static class GltfLoader
                 {
                     material.AlbedoTextureId = albedoTexture.GetProperty("index").GetInt32();
                 }
-                if (pbr.TryGetProperty("normalTexture", out var normalTexture))
-                {
-                    material.NormalTextureId = normalTexture.GetProperty("index").GetInt32();
-                }
+
                 if (pbr.TryGetProperty("metallicRoughnessTexture", out var MetallicRoughnessTexture))
                 {
                     material.MetallicRoughnessTextureId = MetallicRoughnessTexture.GetProperty("index").GetInt32();
                 }
             }
-
+            if (mat.TryGetProperty("normalTexture", out var normalTexture))
+            {
+                material.NormalTextureId = normalTexture.GetProperty("index").GetInt32();
+            }
             // Emissive properties
             if (mat.TryGetProperty("emissiveFactor", out var emission))
             {
@@ -278,6 +291,10 @@ public static class GltfLoader
                     emission[1].GetSingle(),
                     emission[2].GetSingle()
                 );
+            }
+            if (mat.TryGetProperty("emissiveTexture", out var emissionTexture))
+            {
+                material.EmissionTextureId = emissionTexture.GetProperty("index").GetInt32();
             }
 
             // Transmission/extensions
@@ -404,13 +421,10 @@ public static class GltfLoader
     }
     private static void LoadTextures(JsonElement root, byte[][] buffers, GltfScene scene, string basePath)
     {
-        if (!root.TryGetProperty("textures", out var textures)) return;
         if (!root.TryGetProperty("images", out var images)) return;
 
-        foreach (var tex in textures.EnumerateArray())
+        foreach (var image in images.EnumerateArray())
         {
-            int sourceIndex = tex.GetProperty("source").GetInt32();
-            var image = images[sourceIndex];
             byte[]? imageData = null;
 
             // 1. Handle embedded data URI
@@ -447,16 +461,15 @@ public static class GltfLoader
                 continue;
             }
 
-            if (imageData != null)
+            scene.Images.Add(Image.LoadFromBytes(imageData!));
+        }
+
+        if (!root.TryGetProperty("textures", out var textures)) return;
+        foreach (var texture in textures.EnumerateArray())
+        {
+            if(texture.TryGetProperty("source",out var index))
             {
-                try
-                {
-                    scene.Textures.Add(Texture.LoadFromBytes(imageData));
-                }
-                catch
-                {
-                    Console.WriteLine("Warning: Failed to load texture");
-                }
+                scene.Textures.Add(index.GetInt32());
             }
         }
     }
@@ -510,13 +523,12 @@ public static class GltfLoader
             {
                 Index0 = baseVertIndex + idxArr[i],
                 Index1 = baseVertIndex + idxArr[i + 1],
-                Index2 = baseVertIndex + idxArr[i + 2]
+                Index2 = baseVertIndex + idxArr[i + 2],
+                PrimIndex = scene.Primitives.Count
             });
         }
-        for (int i = 0; i < idxArr.Length / 3; i++)
-        {
-            scene.MaterialIndices.Add(materialIndex);
-        }
+        scene.Primitives.Add(new PrimitiveData(materialIndex));
+
     }
 
     private static Vec3[] ReadVector3Array(byte[] buffer, JsonArray accessors, JsonArray views, int accessorIndex)
