@@ -1,5 +1,6 @@
 using OpenTK.Mathematics;
 using OpenTK.Platform;
+using SixLabors.ImageSharp.PixelFormats;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
@@ -8,11 +9,9 @@ using VKGraphics;
 
 namespace VBeamRT.Raytracing.CPU.PathTracing.BVH;
 
-class BVHRaytracer : IRenderer
+sealed partial class BVHRaytracer : IRenderer
 {
-    const float ToRadians = MathF.PI / 180f;
-    const float ToDegrees = 180f / MathF.PI;
-    const int MaxDepth = 128;
+
     readonly Game _game;
     BVH BVH;
     GraphicsDevice _gd;
@@ -97,6 +96,17 @@ class BVHRaytracer : IRenderer
 
     public void Update()
     {
+        if (_game.Input.KeyPressed(Scancode.F11))
+        {
+            if (Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) == WindowMode.WindowedFullscreen)
+            {
+                Toolkit.Window.SetMode(_game.MainWindowInfo.Handle, WindowMode.Normal);
+            }
+            else
+            {
+                Toolkit.Window.SetMode(_game.MainWindowInfo.Handle, WindowMode.WindowedFullscreen);
+            }
+        }
         Toolkit.Window.GetFramebufferSize(_game.MainWindowInfo.Handle, out var framebufferSize);
         if (_linearAccumulationBuffer == null || framebufferSize.X * framebufferSize.Y != _linearAccumulationBuffer.Length)
         {
@@ -138,20 +148,11 @@ class BVHRaytracer : IRenderer
         _gd.SwapBuffers(_swapchain);
     }
 
-    static Vec3 Aces(Vec3 v)
-    {
-        v *= 0.6f;
-        float a = 2.51f;
-        float b = 0.03f;
-        float c = 2.43f;
-        float d = 0.59f;
-        float e = 0.14f;
-        return Vec3.Clamp(v * (a * v + new Vec3(b)) / (v * (c * v + new Vec3(d)) + new Vec3(e)), Vec3.Zero, Vec3.One);
-    }
     int _frameCount = 0;
     void RenderScene(int xPixels, int yPixels)
     {
-        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 80, Vec3.UnitX, Vec3.UnitY);
+
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 125 + Vec3.UnitX * 30 + Vec3.UnitZ * -80, Vec3.UnitX + Vec3.UnitZ*0.5f, Vec3.UnitY);
 
 
         var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
@@ -176,9 +177,12 @@ class BVHRaytracer : IRenderer
                 {
                     if (x >= xPixels) { continue; }
                     var uvCoords = new Vec2(x / (float)xPixels, y / (float)yPixels);
-                    var rayCoords = uvCoords * 2f - Vec2.One;
-                    var ray = Ray.CreateCameraRay(rayCoords, inverseViewMatrix, inverseProjectionMatrix);
-                    Vec3 current = TraceRay(ray);
+
+                    int idx = y * xPixels + x;
+                    Vec3 current =
+                     (_frameCount % 4 == 0) ?
+                    TraceRayWithGradient(x, y, xPixels, yPixels, inverseViewMatrix, inverseProjectionMatrix) :
+                    TraceRay(GenerateRay(uvCoords, inverseViewMatrix, inverseProjectionMatrix));
                     Vec3 prev = _linearAccumulationBuffer[x + y * xPixels];
 
                     _linearAccumulationBuffer[x + y * xPixels] = Vec3.Lerp(prev, current, 1f / _frameCount);
@@ -189,292 +193,100 @@ class BVHRaytracer : IRenderer
         //}
         Console.WriteLine("Samples: " + _frameCount);
     }
-    private static readonly ThreadLocal<PCG32> rng = new(() =>
+    Vec3 TraceRayWithGradient(int x, int y, int _width, int _height, Matrix4x4 inverseViewMatrix, Matrix4x4 inverseProjectionMatrix)
     {
-        ulong threadSeed = (ulong)Environment.TickCount ^ (ulong)Environment.CurrentManagedThreadId;
-        return new PCG32(threadSeed);
-    });
+        const float PixelOffset = 0.7f;  // Fraction of pixel to offset
+        const float kGradientScale = 0.2f;  // Reduced gradient strength
+        Vec3 kGradientClamp = new(5.0f);  // Maximum gradient magnitude
+        const float kMinLuminance = 0.01f;  // Increased minimum luminance threshold
 
-    Vec3 TraceRay(Ray ray)
-    {
-        Vec3 throughput = Vec3.One;
-        Vec3 radiance = Vec3.Zero;
-        bool specularBounce = true; // Start as true to capture emissive surfaces
-        int triTests = 0;
-        int boxTests = 0;
+        // Create primary ray for center of pixel
+        Vec2 centerUV = new Vec2((x + 0.5f) / _width, (y + 0.5f) / _height);
+        Ray centerRay = GenerateRay(centerUV, inverseViewMatrix, inverseProjectionMatrix);
+        Vec3 centerColor = TraceRay(centerRay);
 
+        // Skip gradient computation for dark pixels
+        if (Luminance(centerColor) < kMinLuminance)
+            return centerColor;
 
-        for (int bounce = 0; bounce < MaxDepth; bounce++)
-        {
-            if (!BVH.IntersectClosest(ray, out HitInfo hit))
-            {
-                // HDR environment mapping with physical units
-                Vec3 unitDir = Vec3.Normalize(ray.Direction);
-                float t = 0.5f * (unitDir.Y + 1.0f);
+        // Compute offsets for gradient calculation - use consistent jitter
+        float jitterX = (x % 2 == 0) ? PixelOffset : -PixelOffset;
+        float jitterY = (y % 2 == 0) ? PixelOffset : -PixelOffset;
 
-                // Sun disk approximation
-                float sun = Math.Clamp(Vec3.Dot(unitDir, ToLinear(new Vec3(0.35f, 0.9f, 0.2f))), 0, 1);
-                sun = MathF.Pow(sun, 512) * 20f;
+        Vec2 rightUV = new Vec2((x + 0.5f + jitterX) / _width, (y + 0.5f) / _height);
+        Vec2 leftUV = new Vec2((x + 0.5f - jitterX) / _width, (y + 0.5f) / _height);
+        Vec2 upUV = new Vec2((x + 0.5f) / _width, (y + 0.5f - jitterY) / _height);
+        Vec2 downUV = new Vec2((x + 0.5f) / _width, (y + 0.5f + jitterY) / _height);
 
-                // Improved sky model
-                Vec3 sky = Vec3.Lerp(
-                    ToLinear(new Vec3(0.4f, 0.5f, 0.9f)) * 0.2f,
-                    ToLinear(new Vec3(0.8f, 0.9f, 1.0f)) * 1.5f,
-                    t) + new Vec3(sun, sun * 0.9f, sun * 0.6f);
+        // Create offset rays with consistent ray differentials
+        Ray rightRay = GenerateRay(rightUV, inverseViewMatrix, inverseProjectionMatrix);
+        Ray leftRay = GenerateRay(leftUV, inverseViewMatrix, inverseProjectionMatrix);
+        Ray upRay = GenerateRay(upUV, inverseViewMatrix, inverseProjectionMatrix);
+        Ray downRay = GenerateRay(downUV, inverseViewMatrix, inverseProjectionMatrix);
 
-                //radiance += throughput * sky;
-                triTests += hit.TriTests;
-                boxTests += hit.BoxTests;
-                break;
-            }
-            triTests += hit.TriTests;
-            boxTests += hit.BoxTests;
+        // Trace offset rays with consistent noise patterns
+        Vec3 rightColor = TraceRay(rightRay);
+        Vec3 leftColor = TraceRay(leftRay);
+        Vec3 upColor = TraceRay(upRay);
+        Vec3 downColor = TraceRay(downRay);
 
-            var prim = scene.Primitives[hit.PrimIndex];
-            var mat = scene.Materials[prim.MaterialIndex];
-            Vec3 albedo = mat.AlbedoTextureId >= 0 ?
-              scene.Images[scene.Textures[mat.AlbedoTextureId]].Sample(hit.UV).AsVector3() :
-                mat.Albedo;
+        // Compute gradients using central differences with clamping
+        Vec3 gradientX = (rightColor - leftColor) / (2 * MathF.Abs(jitterX));
+        Vec3 gradientY = (downColor - upColor) / (2 * MathF.Abs(jitterY));
 
-            // Normal mapping
-            Vec3 normal = hit.Normal;
-            Vec3 tangent;
-            Vec3 bitangent;
-            if (mat.NormalTextureId >= 0 && mat.NormalTextureId < scene.Textures.Count)
-            {
-                tangent = CreateOrthonormalBasis(normal);
-                bitangent = Vec3.Cross(normal, tangent);
-                Vec3 texNormal = scene.Images[scene.Textures[mat.NormalTextureId]].Sample(hit.UV).AsVector3() * 2 - Vec3.One;
-                normal = Vec3.Normalize(
-                    tangent * texNormal.X +
-                    bitangent * texNormal.Y +
-                    normal * texNormal.Z);
-            }
+        // Clamp gradients to prevent extreme values
+        gradientX = Vec3.Clamp(gradientX, -kGradientClamp, kGradientClamp);
+        gradientY = Vec3.Clamp(gradientY, -kGradientClamp, kGradientClamp);
 
-            // Add emission with multiple importance sampling
-            //if (bounce == 0 || specularBounce)
-            {
-                Vec3 emission;
-                if (mat.EmissionTextureId >= 0)
-                {
-                    emission = scene.Images[scene.Textures[mat.EmissionTextureId]].Sample(hit.UV).AsVector3()*10;
-                }
-                else
-                {
-                    emission = mat.Emission;
-                }
-
-                radiance += throughput * emission;
-            }
-
-            // Prepare surface information
-            Vec3 hitPoint = ray.GetHitPoint(hit.Distance) + normal * 0.001f;
-            Vec3 shadingNormal = FaceForward(normal, ray.Direction);
-            tangent = CreateOrthonormalBasis(shadingNormal);
-            bitangent = Vec3.Cross(shadingNormal, tangent);
-
-            // Material properties
-            float roughness = float.Max(mat.Roughness, 0.05f);
-            float metallic = mat.Metallic;
-
-            // Sample new direction based on material properties
-            Vec3 worldDir;
-            float pdf;
-            Vec3 brdf;
-
-            // Direct light sampling (Next Event Estimation)
-            //if (bounce < 3 && roughness > 0.1f && scene.Lights.Count > 0)
-            //{
-            //    int lightIdx = (int)(RandomFloat() * scene.Lights.Count);
-            //    var light = scene.Lights[lightIdx];
-
-            //    (Vec3 lightPoint, Vec3 lightNormal, float lightPdf) = light.Sample(hitPoint);
-            //    Vec3 toLight = lightPoint - hitPoint;
-            //    float distSq = toLight.LengthSquared();
-            //    float dist = MathF.Sqrt(distSq);
-            //    Vec3 lightDir = toLight / dist;
-
-            //    float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, lightDir));
-            //    float LdotN = Math.Max(0, Vec3.Dot(lightNormal, -lightDir));
-
-            //    if (NdotL > 0 && LdotN > 0)
-            //    {
-            //        Ray shadowRay = new Ray(hitPoint, lightDir, 0.001f, dist - 0.002f);
-            //        if (!BVH.IntersectAny(shadowRay))
-            //        {
-            //            // BRDF evaluation
-            //            Vec3 halfVec = Vec3.Normalize(-ray.Direction + lightDir);
-            //            float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
-            //            float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-
-            //            // Disney BRDF approximation
-            //            Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
-            //            Vec3 F = FresnelSchlick(NdotV, F0);
-            //            float D = DistributionGGX(NdotH, roughness);
-            //            float G = GeometrySmith(NdotV, NdotL, roughness);
-            //            Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
-
-            //            Vec3 kS = F;
-            //            Vec3 kD = (Vec3.One - kS) * (1 - metallic);
-            //            Vec3 diffuse = kD * albedo / MathF.PI;
-
-            //            Vec3 brdfVal = diffuse + specular;
-            //            float cosTheta = Math.Max(NdotL, 0.001f);
-
-            //            // Light contribution
-            //            Vec3 lightContrib = light.Emission * brdfVal * cosTheta * LdotN / (distSq * lightPdf);
-            //            radiance += throughput * lightContrib;
-            //        }
-            //    }
-            //}
-
-            // BRDF Importance Sampling
-            if (roughness < 0.1f && metallic > 0.7f)  // Specular material
-            {
-                // GGX importance sampling for specular
-                Vec2 r = Random2();
-                Vec3 halfVector = SampleGGX(r.X, r.Y, roughness, shadingNormal, tangent, bitangent);
-                worldDir = Vec3.Reflect(ray.Direction, halfVector);
-
-                // Calculate PDF and BRDF
-                float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-                float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
-                float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVector));
-
-                Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
-                Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVector, -ray.Direction)), F0);
-                float D = DistributionGGX(NdotH, roughness);
-                pdf = (D * NdotH) / (4 * Math.Max(1e-8f, Vec3.Dot(-ray.Direction, halfVector)));
-                brdf = F * D / (4 * NdotV * NdotL + 1e-8f);
-
-                specularBounce = true;
-            }
-            else  // Diffuse or glossy material
-            {
-                float r1 = RandomFloat();
-                float r2 = RandomFloat();
-                // Precomputed cosine-weighted sampling
-                float cosTheta = float.Sqrt(1 - r2);
-                float sinTheta = float.Sqrt(r2);
-                float phi = 2 * float.Pi * r1;
-
-                // Local space direction
-                Vec3 localDir = new Vec3(
-                    MathF.Cos(phi) * sinTheta,
-                    MathF.Sin(phi) * sinTheta,
-                    cosTheta
-                );
-
-                // Transform to world space
-                worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
-
-                // Compute PDF for cosine-weighted hemisphere
-                pdf = cosTheta / MathF.PI;
-
-                // Disney BRDF with metallic and roughness
-                float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-                float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
-                Vec3 halfVec = Vec3.Normalize(-ray.Direction + worldDir);
-                float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
-
-                Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo, metallic);
-                Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
-                float D = DistributionGGX(NdotH, roughness);
-                float G = GeometrySmith(NdotV, NdotL, roughness);
-
-                Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
-                Vec3 kS = F;
-                Vec3 kD = (Vec3.One - kS) * (1 - metallic);
-                Vec3 diffuse = kD * albedo / MathF.PI;
-
-                brdf = diffuse + specular;
-                specularBounce = false;
-            }
-
-            // Update throughput with BRDF and PDF
-            float cosThetaOut = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
-            throughput *= brdf * cosThetaOut / pdf;
-
-            // Update ray for next bounce
-            ray = new Ray(hitPoint, worldDir);
-
-            // Russian Roulette termination with energy preservation
-            if (bounce > 2)
-            {
-                float q = Math.Max(0.05f, 1 - MathF.Max(throughput.X, MathF.Max(throughput.Y, throughput.Z)));
-                if (RandomFloat() < q) break;
-                throughput /= (1 - q);
-            }
-        }
-
-        return radiance;
-    }
-
-    // Helper functions
-    float DistributionGGX(float NdotH, float roughness)
-    {
-        float a = roughness * roughness;
-        float a2 = a * a;
-        float denom = NdotH * NdotH * (a2 - 1) + 1;
-        return a2 / (MathF.PI * denom * denom);
-    }
-
-    float GeometrySchlickGGX(float NdotV, float roughness)
-    {
-        float r = (roughness + 1);
-        float k = (r * r) / 8;
-        return NdotV / (NdotV * (1 - k) + k);
-    }
-
-    float GeometrySmith(float NdotV, float NdotL, float roughness)
-    {
-        return GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
-    }
-
-    Vec3 FresnelSchlick(float cosTheta, Vec3 F0)
-    {
-        return F0 + (Vec3.One - F0) * MathF.Pow(1 - cosTheta, 5);
-    }
-
-    Vec3 SampleGGX(float u1, float u2, float roughness, Vec3 normal, Vec3 tangent, Vec3 bitangent)
-    {
-        float a = roughness * roughness;
-        float phi = 2 * MathF.PI * u1;
-        float cosTheta = MathF.Sqrt((1 - u2) / (1 + (a * a - 1) * u2));
-        float sinTheta = MathF.Sqrt(1 - cosTheta * cosTheta);
-
-        Vec3 halfVector = new Vec3(
-            MathF.Cos(phi) * sinTheta,
-            MathF.Sin(phi) * sinTheta,
-            cosTheta
+        // Compute adaptive gradient scale based on local contrast
+        float centerLum = Luminance(centerColor);
+        float contrast = 0.5f * (
+            MathF.Abs(Luminance(rightColor) - centerLum) +
+            MathF.Abs(Luminance(leftColor) - centerLum) +
+            MathF.Abs(Luminance(upColor) - centerLum) +
+            MathF.Abs(Luminance(downColor) - centerLum)
         );
 
-        return halfVector.X * tangent + halfVector.Y * bitangent + halfVector.Z * normal;
+        float adaptiveScale = kGradientScale * MathF.Min(1.0f, 1.0f / (contrast + 0.1f));
+
+        // Apply gradient-domain adjustment with gamma-aware operation
+        Vec3 adjustedColor = centerColor - adaptiveScale * (gradientX + gradientY);
+
+        // Maintain energy conservation
+        adjustedColor = Vec3.Max(adjustedColor, Vec3.Zero);
+
+        // Blend with original color to reduce artifacts
+        float blendFactor = MathF.Min(1.0f, contrast * 2.0f);
+        return Vec3.Lerp(centerColor, adjustedColor, blendFactor);
+    }
+    static Ray GenerateRay(Vec2 uv, Matrix4x4 inverseViewMatrix, Matrix4x4 inverseProjectionMatrix)
+    {
+        var rayCoords = uv * 2f - Vec2.One;
+        var ray = Ray.CreateCameraRay(rayCoords, inverseViewMatrix, inverseProjectionMatrix);
+        return ray;
     }
 
-    static Vec3 CreateOrthonormalBasis(Vec3 normal)
+    static Vec3 ClampFirefly(Vec3 sample, Vec3 mean, float maxRelative)
     {
-        Vec3 tangent;
-        if (MathF.Abs(normal.X) > MathF.Abs(normal.Y))
-            tangent = Vec3.Normalize(new Vec3(normal.Z, 0, -normal.X));
-        else
-            tangent = Vec3.Normalize(new Vec3(0, -normal.Z, normal.Y));
-        return tangent;
+        Vec3 ratio = sample / mean;
+        float maxRatio = Math.Max(ratio.X, Math.Max(ratio.Y, ratio.Z));
+
+        if (maxRatio > maxRelative)
+        {
+            return mean + (sample - mean) * (maxRelative / maxRatio);
+        }
+        return sample;
     }
 
-    static Vec3 FaceForward(Vec3 normal, Vec3 direction)
+    static Vec3 Aces(Vec3 v)
     {
-        return Vec3.Dot(normal, direction) < 0 ? normal : -normal;
-    }
-
-    static Vec2 Random2()
-    {
-        return rng.Value.NextVec2();
-    }
-
-    static float RandomFloat()
-    {
-        return rng.Value.NextFloat();
+        v *= 0.6f;
+        float a = 2.51f;
+        float b = 0.03f;
+        float c = 2.43f;
+        float d = 0.59f;
+        float e = 0.14f;
+        return Vec3.Clamp(v * (a * v + new Vec3(b)) / (v * (c * v + new Vec3(d)) + new Vec3(e)), Vec3.Zero, Vec3.One);
     }
 
     static Vec3 ToLinear(Vec3 src)
@@ -492,8 +304,6 @@ class BVHRaytracer : IRenderer
         src.Z = float.Pow(src.Z, 1 / 2.2f);
         return src;
     }
-
-
 
     public void Dispose()
     {

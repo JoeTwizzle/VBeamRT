@@ -65,9 +65,9 @@ public sealed partial class BVH
         return currentIndex;
     }
 
-    public bool IntersectClosest(Ray ray, out HitInfo hitInfo)
+    public bool IntersectClosest(Ray ray, out HitInfo hitInfo, int ignoredTri = -1)
     {
-        hitInfo = new HitInfo { Distance = float.PositiveInfinity, PrimIndex = -1, BoxTests = 0, TriTests = 0 };
+        hitInfo = new HitInfo { Distance = ray.TMax, PrimIndex = -1, BoxTests = 0, TriTests = 0 };
 
         Vec3 invDir = new Vec3(1f) / ray.Direction;
         Vector3i sign = new Vector3i(
@@ -105,7 +105,7 @@ public sealed partial class BVH
                 if (Vector128.IsHardwareAccelerated && (end - start) >= 4)
                 {
                     const float EPSILON = 1e-6f;
-                    Vector128<float> epsilonVec = Vector128.Create(EPSILON);
+                    Vector128<float> epsilonVec = Vector128.Create(ray.TMin);
                     Vector128<float> oneVec = Vector128.Create(1.0001f);
                     Vector128<float> zeroVec = Vector128<float>.Zero;
                     Vector128<float> maxValueVec = Vector128.Create(float.MaxValue);
@@ -257,7 +257,7 @@ public sealed partial class BVH
                         // Extract distances and find closest hit
                         finalHitDist.StoreUnsafe(ref MemoryMarshal.GetReference(distances));
 
-                        float minDist = float.MaxValue;
+                        float minDist = float.PositiveInfinity;
                         int minIndex = -1;
                         for (int j = 0; j < 4; j++)
                         {
@@ -269,7 +269,7 @@ public sealed partial class BVH
                         }
                         hitInfo.TriTests += 4;
                         // Update hit info if we found a closer intersection
-                        if (minIndex >= 0 && minDist < currentMinDistance)
+                        if (minIndex >= 0 && i + minIndex != ignoredTri && minDist > ray.TMin && minDist < currentMinDistance)
                         {
                             currentMinDistance = minDist;
                             currentMinDistVec = Vector128.Create(minDist);
@@ -277,6 +277,7 @@ public sealed partial class BVH
 
                             hitInfo.Distance = minDist;
                             hitInfo.PrimIndex = hitTri.PrimIndex;
+                            hitInfo.TriIndex = i + minIndex;
                             hitInfo.BarycentricU = baryU.GetElement(minIndex);
                             hitInfo.BarycentricV = baryV.GetElement(minIndex);
 
@@ -312,16 +313,18 @@ public sealed partial class BVH
                 // Process remaining triangles with scalar method
                 for (; i < end; i++)
                 {
+                    if (i == ignoredTri) continue;
                     ref Triangle tri = ref triangles[i];
                     hitInfo.TriTests++;
                     if (RayIntersectsTriangle(ray, tri, out float t, out float u, out float v, out bool backface) &&
-                        t < currentMinDistance)
+                        t < currentMinDistance && t > ray.TMin)
                     {
                         currentMinDistance = t;
                         hitInfo.Distance = t;
                         hitInfo.PrimIndex = tri.PrimIndex;
                         hitInfo.BarycentricU = u;
                         hitInfo.BarycentricV = v;
+                        hitInfo.TriIndex = i;
 
                         float w = 1f - u - v;
                         ref Vertex v0 = ref vertices[tri.Index0];
@@ -348,7 +351,7 @@ public sealed partial class BVH
                 // Internal node: test both children and push nearer first
                 int left = node.LeftChild;
                 int right = node.RightChild;
-                IntersectAABB2(flatBVH[left].Bounds, flatBVH[right].Bounds, ray.Origin, sign, invDir, hitInfo.Distance,
+                IntersectAABB2(flatBVH[left].Bounds, flatBVH[right].Bounds, ray.Origin, ray.TMin, sign, invDir, hitInfo.Distance,
                     out bool hitLeft, out float tminLeft, out bool hitRight, out float tminRight);
                 //bool hitLeft = IntersectAABB(flatBVH[left].Bounds, ray.Origin, sign, invDir,
                 //                            hitInfo.Distance, out float tminLeft);
@@ -441,6 +444,7 @@ public sealed partial class BVH
                     hitInfo.BarycentricU = u;
                     hitInfo.BarycentricV = v;
 
+
                     float w = 1f - u - v;
 
                     Vec3 n0 = v0.Normal;
@@ -460,12 +464,12 @@ public sealed partial class BVH
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool RayIntersectsTriangle(
-Ray ray,
-Triangle triangle,
-out float hitDistance,
-out float barycentricU,
-out float barycentricV,
-out bool hitBackface)
+    Ray ray,
+    Triangle triangle,
+    out float hitDistance,
+    out float barycentricU,
+    out float barycentricV,
+    out bool hitBackface)
     {
         // Load vertices using SIMD registers
         ref Vec3 v0 = ref vertices[triangle.Index0].Position;
@@ -519,7 +523,7 @@ out bool hitBackface)
 
             // Compute hit distance = dot(edge2, qVec) * invDet
             hitDistance = DotSimd(edge2, qVec) * invDet;
-            bool distanceValid = hitDistance > EPSILON;
+            bool distanceValid = hitDistance > ray.TMin;
 
             // Combine all conditions
             bool hit = !parallel && uValid && vValid && distanceValid;
@@ -571,7 +575,7 @@ out bool hitBackface)
             }
 
             hitDistance = Vec3.Dot(edge2, qVec) * invDet;
-            return hitDistance > EPSILON;
+            return hitDistance > ray.TMin;
         }
     }
 
@@ -656,7 +660,7 @@ out bool hitBackface)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void IntersectAABB2(
     AABB leftBox, AABB rightBox,
-    Vec3 rayOrigin, Vector3i raySign, Vec3 rayInvDir, float maxDistance,
+    Vec3 rayOrigin, float minDist, Vector3i raySign, Vec3 rayInvDir, float maxDistance,
     out bool hitLeft, out float tminLeft,
     out bool hitRight, out float tminRight)
     {
@@ -716,8 +720,8 @@ out bool hitBackface)
         float tmaxRight = tMax.GetElement(1);
 
         // Check intersection conditions
-        hitLeft = (tminLeft <= tmaxLeft) && (tminLeft < maxDistance) && (tmaxLeft > 0);
-        hitRight = (tminRight <= tmaxRight) && (tminRight < maxDistance) && (tmaxRight > 0);
+        hitLeft = (tminLeft <= tmaxLeft) && (tminLeft < maxDistance) && (tmaxLeft > minDist);
+        hitRight = (tminRight <= tmaxRight) && (tminRight < maxDistance) && (tmaxRight > minDist);
     }
     [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

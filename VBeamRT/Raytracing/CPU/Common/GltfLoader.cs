@@ -16,6 +16,12 @@ public sealed class AnimationChannel
     // Vec3 or Quaternion
     public Vector4[] Values;
 }
+public enum FilterMode
+{
+    Point,
+    Bilinear
+}
+
 public sealed class Image
 {
     public int Width { get; }
@@ -54,7 +60,7 @@ public sealed class Image
         });
         return texture;
     }
-    public Vec4 Sample(Vec2 uv)
+    public Vec4 Sample(Vec2 uv, FilterMode filterMode)
     {
         // Bilinear filtering
         float u = Math.Clamp(uv.X, 0, 1);
@@ -66,29 +72,38 @@ public sealed class Image
 
         int x0 = (int)u;
         int y0 = (int)v;
-        int x1 = Math.Min(x0 + 1, Width - 1);
-        int y1 = Math.Min(y0 + 1, Height - 1);
 
-        // Ensure coordinates stay within bounds
-        x0 = Math.Clamp(x0, 0, Width - 1);
-        y0 = Math.Clamp(y0, 0, Height - 1);
-        x1 = Math.Clamp(x1, 0, Width - 1);
-        y1 = Math.Clamp(y1, 0, Height - 1);
+        if (filterMode == FilterMode.Point)
+        {
+            return GetPixel(x0, y0);
+        }
+        else if (filterMode == FilterMode.Bilinear)
+        {
 
-        float fracU = u - x0;
-        float fracV = v - y0;
+            int x1 = Math.Min(x0 + 1, Width - 1);
+            int y1 = Math.Min(y0 + 1, Height - 1);
+
+            // Ensure coordinates stay within bounds
+            x0 = Math.Clamp(x0, 0, Width - 1);
+            y0 = Math.Clamp(y0, 0, Height - 1);
+            x1 = Math.Clamp(x1, 0, Width - 1);
+            y1 = Math.Clamp(y1, 0, Height - 1);
+
+            float fracU = u - x0;
+            float fracV = v - y0;
 
 
-        Vec4 c00 = GetPixel(x0, y0);
-        Vec4 c10 = GetPixel(x1, y0);
-        Vec4 c01 = GetPixel(x0, y1);
-        Vec4 c11 = GetPixel(x1, y1);
+            Vec4 c00 = GetPixel(x0, y0);
+            Vec4 c10 = GetPixel(x1, y0);
+            Vec4 c01 = GetPixel(x0, y1);
+            Vec4 c11 = GetPixel(x1, y1);
 
-        return Vec4.Lerp(
-            Vec4.Lerp(c00, c10, fracU),
-            Vec4.Lerp(c01, c11, fracU),
-            fracV
-        );
+            return Vec4.Lerp(
+                Vec4.Lerp(c00, c10, fracU),
+                Vec4.Lerp(c01, c11, fracU),
+                fracV);
+        }
+        return GetPixel(x0, y0);
     }
     private Vec4 GetPixel(int x, int y)
     {
@@ -100,7 +115,7 @@ public sealed class Image
 }
 public struct Material
 {
-    public Vec3 Albedo;
+    public Vec4 Albedo;
     public Vec3 Emission;
     public float Roughness;
     public float Metallic;
@@ -222,7 +237,7 @@ public static class GltfLoader
     {
         scene.Materials.Add(new Material
         {
-            Albedo = new Vec3(0.8f),
+            Albedo = new Vec4(0.8f, 0.8f, 0.8f, 1f),
             Emission = Vec3.Zero,
             Roughness = 1.0f,
             Metallic = 0.0f,
@@ -238,7 +253,7 @@ public static class GltfLoader
         {
             var material = new Material
             {
-                Albedo = new Vec3(0.8f, 0, 0.8f),
+                Albedo = new Vec4(0.8f, 0, 0.8f, 1f),
                 Emission = Vec3.Zero,
                 Roughness = 1.0f,
                 Metallic = 0.0f,
@@ -255,10 +270,11 @@ public static class GltfLoader
             {
                 if (pbr.TryGetProperty("baseColorFactor", out var baseColor))
                 {
-                    material.Albedo = new Vec3(
+                    material.Albedo = new Vec4(
                         baseColor[0].GetSingle(),
                         baseColor[1].GetSingle(),
-                        baseColor[2].GetSingle()
+                        baseColor[2].GetSingle(),
+                        1
                     );
                 }
 
@@ -467,7 +483,7 @@ public static class GltfLoader
         if (!root.TryGetProperty("textures", out var textures)) return;
         foreach (var texture in textures.EnumerateArray())
         {
-            if(texture.TryGetProperty("source",out var index))
+            if (texture.TryGetProperty("source", out var index))
             {
                 scene.Textures.Add(index.GetInt32());
             }

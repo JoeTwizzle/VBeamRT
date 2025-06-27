@@ -27,6 +27,7 @@ public struct HitInfo
 {
     public float Distance;       // t along ray
     public int PrimIndex;    // hit triangle index
+    public int TriIndex;    // hit triangle index
     public int BoxTests;    // hit triangle index
     public int TriTests;    // hit triangle index
     public float BarycentricU;   // u barycentric coord

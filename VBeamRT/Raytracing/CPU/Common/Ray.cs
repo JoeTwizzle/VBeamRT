@@ -11,12 +11,24 @@ namespace VBeamRT.Raytracing.CPU.Common;
 public struct Ray
 {
     public Vec3 Origin;
+    public float TMin;
     public Vec3 Direction;
+    public float TMax;
 
     public Ray(Vec3 origin, Vec3 direction)
     {
         Origin = origin;
         Direction = direction;
+        TMin = 0;
+        TMax = float.MaxValue;
+    }
+
+    public Ray(Vec3 origin, float tMin, Vec3 direction, float tMax)
+    {
+        Origin = origin;
+        TMin = tMin;
+        Direction = direction;
+        TMax = tMax;
     }
 
     public static Ray CreateCameraRay(Vec2 rayCoords, Matrix4x4 inverseViewMatrix, Matrix4x4 inverseProjectionMatrix)
@@ -37,7 +49,11 @@ public struct Ray
         Vec3 origin = Vec3.Transform(Vec3.Zero, inverseViewMatrix);
         Vec3 direction = Vec3.Normalize(Vec4.Transform(viewDirH, inverseViewMatrix).AsVector128().AsVector3());
 
-        return new Ray(origin, direction);
+        if (direction.LengthSquared() < 1e-12f)
+        {
+            // Add slight bias to prevent pure zero direction
+            direction += new Vec3(1e-6f, 1e-6f, 1e-6f);
+        }
 
         return new Ray(origin, direction);
     }
