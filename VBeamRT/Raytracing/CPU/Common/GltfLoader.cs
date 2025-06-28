@@ -161,7 +161,20 @@ public sealed class GltfScene
     public List<Light> Lights = [];
     public List<AnimationChannel> Animations = [];
     public List<Image> Images = [];
-    public List<int> Textures = [];
+    public List<TextureUse> Textures = [];
+    public List<FilterMode> FilterModes = [];
+}
+
+public readonly struct TextureUse
+{
+    public readonly int ImageId;
+    public readonly int SamplerId;
+
+    public TextureUse(int imageId, int samplerId)
+    {
+        ImageId = imageId;
+        SamplerId = samplerId;
+    }
 }
 
 public struct PrimitiveData
@@ -247,7 +260,7 @@ public static class GltfLoader
     {
         scene.Materials.Add(new Material
         {
-            Albedo = new Vec4(0.8f, 0.8f, 0.8f, 1f),
+            Albedo = new Vec4(1f, 0.0f, 1f, 1f),
             Emission = Vec3.Zero,
             Roughness = 1.0f,
             Metallic = 0.0f,
@@ -264,7 +277,7 @@ public static class GltfLoader
         {
             var material = new Material
             {
-                Albedo = new Vec4(0.8f, 0, 0.8f, 1f),
+                Albedo = new Vec4(1),
                 Emission = Vec3.Zero,
                 Roughness = 1.0f,
                 Metallic = 0.0f,
@@ -579,7 +592,26 @@ public static class GltfLoader
         {
             if (texture.TryGetProperty("source", out var index))
             {
-                scene.Textures.Add(index.GetInt32());
+                if (texture.TryGetProperty("sampler", out var index2))
+                {
+                    scene.Textures.Add(new TextureUse(index.GetInt32(), index2.GetInt32()));
+                }
+            }
+        }
+
+        if (!root.TryGetProperty("samplers", out var samplers)) return;
+        foreach (var sampler in samplers.EnumerateArray())
+        {
+            if (sampler.TryGetProperty("magFilter", out var index))
+            {
+                var filterId = index.GetInt32();
+                FilterMode filterMode = filterId switch
+                {
+                    9729 => FilterMode.Bilinear,
+                    9728 => FilterMode.Point,
+                    _ => FilterMode.Bilinear,
+                };
+                scene.FilterModes.Add(filterMode);
             }
         }
     }

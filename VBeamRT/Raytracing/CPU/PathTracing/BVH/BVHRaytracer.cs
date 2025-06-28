@@ -36,8 +36,8 @@ sealed partial class BVHRaytracer : IRenderer
 #pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
     {
         _game = game;
-        scene = GltfLoader.Load("Models/alfa_romeo_stradale_1967.glb");
-        //scene = GltfLoader.Load("Models/Beta map split.glb");
+        //scene = GltfLoader.Load("Models/alfa_romeo_stradale_1967.glb");
+        scene = GltfLoader.Load("Models/Beta map split.glb");
         vertices = [.. scene.Vertices];
         triangles = [.. scene.Triangles];
         BVH = new BVH(vertices, triangles);
@@ -167,13 +167,14 @@ sealed partial class BVHRaytracer : IRenderer
     int _frameCount = 0;
     void RenderScene(int xPixels, int yPixels)
     {
+        //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 75 + Vec3.UnitX * 10 + Vec3.UnitZ * -50, Vec3.UnitX + Vec3.UnitZ, Vec3.UnitY);
 
-        //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 115 + Vec3.UnitX * 64 + Vec3.UnitZ * -65, Vec3.UnitX + Vec3.UnitZ * 0.5f, Vec3.UnitY);
-        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 8 + Vec3.UnitZ * 35 + Vec3.UnitZ * 1, -Vec3.UnitZ, Vec3.UnitY);
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 115 + Vec3.UnitX * 64 + Vec3.UnitZ * -65, Vec3.UnitX + Vec3.UnitZ * 0.5f, Vec3.UnitY);
+        //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 8 + Vec3.UnitZ * 35 + Vec3.UnitZ * 1, -Vec3.UnitZ, Vec3.UnitY);
 
 
         var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
-            40 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
+            60 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
         Matrix4x4.Invert(projectionMatrix, out var inverseProjectionMatrix);
         Matrix4x4.Invert(viewMatrix, out var inverseViewMatrix);
         _frameCount++;
@@ -300,6 +301,15 @@ sealed partial class BVHRaytracer : IRenderer
         src.X = float.Pow(src.X, 2.2f);
         src.Y = float.Pow(src.Y, 2.2f);
         src.Z = float.Pow(src.Z, 2.2f);
+        return src;
+    }
+
+    static Vec4 ToLinear(Vec4 src)
+    {
+        src.X = float.Pow(src.X, 2.2f);
+        src.Y = float.Pow(src.Y, 2.2f);
+        src.Z = float.Pow(src.Z, 2.2f);
+        src.W = float.Pow(src.W, 2.2f);
         return src;
     }
 
