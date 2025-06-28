@@ -33,29 +33,50 @@ public struct Ray
 
     public static Ray CreateCameraRay(Vec2 rayCoords, Matrix4x4 inverseViewMatrix, Matrix4x4 inverseProjectionMatrix)
     {
-        // ndcUV is in range [0,1]; convert to NDC in [-1,1]
+        // Convert to NDC [-1, 1] (flip Y for standard graphics pipeline)
+        float x = rayCoords.X ;
+        float y = rayCoords.Y ; // Flip Y-axis
 
-        // Build clip space position on near plane (z = -1 in OpenGL, or z = 1 in DirectX)
-        Vec4 clipPos = new Vec4(rayCoords, -1f, 1f);
+        // Create clip position with robust near-plane handling
+        Vec4 clipPos = new Vec4(x, y, -1f, 1f); 
 
-        // Transform into view (camera) space
+        // Transform to view space
         Vec4 viewPosH = Vec4.Transform(clipPos, inverseProjectionMatrix);
-        viewPosH /= viewPosH.W; // Perspective divide
+        viewPosH /= viewPosH.W;
 
-        // Interpret as a direction from the camera origin
+        // Create direction vector
         Vec4 viewDirH = new Vec4(viewPosH.X, viewPosH.Y, viewPosH.Z, 0f);
 
-        // Transform origin and direction into world space
+        // Transform to world space
         Vec3 origin = Vec3.Transform(Vec3.Zero, inverseViewMatrix);
-        Vec3 direction = Vec3.Normalize(Vec4.Transform(viewDirH, inverseViewMatrix).AsVector128().AsVector3());
+        Vec3 direction = Vec3.Normalize(Vec4.Transform(viewDirH, inverseViewMatrix).AsVector3());
 
-        if (direction.LengthSquared() < 1e-12f)
-        {
-            // Add slight bias to prevent pure zero direction
-            direction += new Vec3(1e-6f, 1e-6f, 1e-6f);
-        }
+        // Apply robust direction handling
+        direction = RobustDirection(direction);
 
         return new Ray(origin, direction);
+    }
+
+    private static Vec3 RobustDirection(Vec3 dir)
+    {
+        const float threshold = 1e-6f;
+        const float safeValue = 1e-5f; // Small but meaningful value
+
+        // Maintain original magnitude while ensuring no zero components
+        float origMagnitude = dir.Length();
+
+        // Handle near-zero components with sign preservation
+        dir.X = MathF.Abs(dir.X) < threshold ?
+            MathF.CopySign(safeValue, dir.X) : dir.X;
+
+        dir.Y = MathF.Abs(dir.Y) < threshold ?
+            MathF.CopySign(safeValue, dir.Y) : dir.Y;
+
+        dir.Z = MathF.Abs(dir.Z) < threshold ?
+            MathF.CopySign(safeValue, dir.Z) : dir.Z;
+
+        // Restore original magnitude to preserve ray energy
+        return Vec3.Normalize(dir) * origMagnitude;
     }
 
     public readonly Vec3 GetHitPoint(float hitDist)

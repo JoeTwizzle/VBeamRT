@@ -67,9 +67,10 @@ public sealed partial class BVH
 
     public bool IntersectClosest(Ray ray, out HitInfo hitInfo, int ignoredTri = -1)
     {
-        hitInfo = new HitInfo { Distance = ray.TMax, PrimIndex = -1, BoxTests = 0, TriTests = 0 };
+        hitInfo = new HitInfo { Distance = ray.TMax, TriIndex = -1, PrimIndex = -1, BoxTests = 0, TriTests = 0 };
 
         Vec3 invDir = new Vec3(1f) / ray.Direction;
+
         Vector3i sign = new Vector3i(
             ray.Direction.X < 0 ? 1 : 0,
             ray.Direction.Y < 0 ? 1 : 0,

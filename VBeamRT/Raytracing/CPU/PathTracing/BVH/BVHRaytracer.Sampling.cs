@@ -123,26 +123,26 @@ sealed partial class BVHRaytracer : IRenderer
         int triTests = 0;
         int boxTests = 0;
         int prevTri = -1;
+        float currentIOR = 1.0f;  // Start in air
 
         // Firefly reduction state
         float pathLuminance = 0;
         const float MaxPathLuminance = 1000f;
         const float FireflyClampThreshold = 25f;
 
-        for (int bounce = 0; bounce < MaxDepth; bounce++)
+        // Change to while-loop for better bounce control
+        int bounce = 0;
+        while (bounce < MaxDepth)
         {
             if (!BVH.IntersectClosest(ray, out HitInfo hit, prevTri))
             {
-
-                Vec3 sky = GetSkyColor(ray.Direction, Vec3.Normalize(new Vec3(0.5f, -0.5f, 0)));
-                // Apply firefly clamp to environment contribution
+                Vec3 sky = GetSkyColor(ray.Direction, Vec3.Normalize(new Vec3(0.5f, 0.5f, 0)));
                 Vec3 envContrib = throughput * sky;
                 float envLum = Luminance(envContrib);
                 if (envLum > FireflyClampThreshold)
                 {
-                    envContrib *= FireflyClampThreshold / envLum;
+                    envContrib *= FireflyClampThreshold / (envLum + 0.00001f);
                 }
-
                 radiance += envContrib;
                 break;
             }
@@ -152,9 +152,27 @@ sealed partial class BVHRaytracer : IRenderer
 
             var prim = scene.Primitives[hit.PrimIndex];
             var mat = scene.Materials[prim.MaterialIndex];
+            //if (prim.MaterialIndex == 19)
+            //{
+            //    Console.WriteLine();
+            //}
+            // Sample albedo with alpha channel
             Vec4 albedo = mat.AlbedoTextureId >= 0 ?
-              scene.Images[scene.Textures[mat.AlbedoTextureId]].Sample(hit.UV, FilterMode.Point) :
-              mat.Albedo;
+                scene.Images[scene.Textures[mat.AlbedoTextureId]].Sample(hit.UV, FilterMode.Point) * mat.Albedo :
+                mat.Albedo;
+            float alpha = albedo.W;
+            prevTri = hit.TriIndex;
+            // ========================================
+            // NEW: Alpha masking (cutout transparency)
+            // ========================================
+            if (mat.AlphaBlendMode == AlphaBlendMode.Clip && alpha < 0.999f)
+            {
+                // Pass through without interaction
+                Vec3 newOrigin = ray.GetHitPoint(hit.Distance) + ray.Direction * 0.01f;
+                ray = new Ray(newOrigin, ray.Direction);
+                // Prevent self-intersection
+                continue;  // Retain same bounce count
+            }
 
             // Normal mapping
             Vec3 normal = hit.Normal;
@@ -194,13 +212,16 @@ sealed partial class BVHRaytracer : IRenderer
             }
 
             // Firefly clamp for emission
-            Vec3 emissionContrib = throughput * emission;
-            float emissionLum = Luminance(emissionContrib);
-            if (emissionLum > FireflyClampThreshold)
+            if (mat.AlphaBlendMode != AlphaBlendMode.Blend || alpha > 0.01f)
             {
-                emissionContrib *= FireflyClampThreshold / emissionLum;
+                Vec3 emissionContrib = throughput * emission;
+                float emissionLum = Luminance(emissionContrib);
+                if (emissionLum > FireflyClampThreshold)
+                {
+                    emissionContrib *= FireflyClampThreshold / (emissionLum + 1e-6f);
+                }
+                radiance += emissionContrib;
             }
-            radiance += emissionContrib;
 
             // Prepare surface information
             Vec3 hitPoint = ray.GetHitPoint(hit.Distance) + normal * 0.001f;
@@ -211,109 +232,223 @@ sealed partial class BVHRaytracer : IRenderer
             // Material properties
             float roughness = Math.Max(mat.Roughness, 0.05f);
             float metallic = mat.Metallic;
-
-            if (albedo.W > 0.1f && prevTri != hit.TriIndex)
+            bool isTransmissive = mat.Transmission > 0;
+            if (ray.Direction.X == 0)
             {
-                Vec3 worldDir;
-                float pdf;
-                Vec3 brdf;
+                Console.WriteLine();
+            }
+            Vec3 worldDir;
+            float pdf;
+            Vec3 brdf = Vec3.One;  // Default to white for transparency
 
-                // Sample warping for specular materials
-                if (roughness < 0.3f && metallic > 0.5f)
+            // ======================================================
+            // NEW: Smooth transparency blending using alpha channel
+            // ======================================================
+            if (mat.AlphaBlendMode == AlphaBlendMode.Blend && alpha < 0.999f)
+            {
+                // Blend between surface interaction and transmission
+                if (RandomFloat() < alpha)
                 {
-                    // Warp samples toward specular lobe
-                    Vec2 r = Random2();
-                    float warpFactor = 1.0f - roughness * 2.0f;
-
-                    //if (r.X < warpFactor)
-                    //{
-                    //	// Warped GGX sampling
-                    //	Vec3 halfVector = SampleGGX(r.X / warpFactor, r.Y, roughness, shadingNormal, tangent, bitangent);
-                    //	worldDir = Vec3.Reflect(ray.Direction, halfVector);
-
-                    //	// Calculate PDF for warped sampling
-                    //	float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-                    //	float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
-                    //	float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVector));
-                    //	Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo.AsVector3(), metallic);
-                    //	Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVector, -ray.Direction)), F0);
-                    //	float D = DistributionGGX(NdotH, roughness);
-                    //	pdf = (D * NdotH) / (4 * Math.Max(1e-8f, Vec3.Dot(-ray.Direction, halfVector)));
-                    //	brdf = F * D / (4 * NdotV * NdotL + 1e-8f);
-                    //}
-                    //else
-                    {
-                        // Fallback to cosine sampling
-                        float r1 = r.X / (1 - warpFactor);
-                        float r2 = r.Y;
-                        float cosTheta = MathF.Sqrt(1 - r2);
-                        float sinTheta = MathF.Sqrt(r2);
-                        float phi = 2 * MathF.PI * r1;
-
-                        Vec3 localDir = new Vec3(
-                            MathF.Cos(phi) * sinTheta,
-                            MathF.Sin(phi) * sinTheta,
-                            cosTheta
-                        );
-
-                        worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
-                        pdf = cosTheta / MathF.PI;
-
-                        // Standard BRDF evaluation
-                        float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-                        float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
-                        Vec3 halfVec = Vec3.Normalize(-ray.Direction + worldDir);
-                        float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
-                        Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo.AsVector3(), metallic);
-                        Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
-                        float D = DistributionGGX(NdotH, roughness);
-                        float G = GeometrySmith(NdotV, NdotL, roughness);
-                        Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
-                        Vec3 kS = F;
-                        Vec3 kD = (Vec3.One - kS) * (1 - metallic);
-                        Vec3 diffuse = kD * albedo.AsVector3() / MathF.PI;
-                        brdf = diffuse + specular;
-                    }
+                    // Process surface interaction (keep existing code)
+                    goto SurfaceInteraction;
                 }
                 else
                 {
-                    // Standard sampling for non-specular materials
-                    float r1 = RandomFloat();
-                    float r2 = RandomFloat();
-                    float cosTheta = MathF.Sqrt(1 - r2);
-                    float sinTheta = MathF.Sqrt(r2);
-                    float phi = 2 * MathF.PI * r1;
+                    // Straight transmission (no change in direction)
+                    worldDir = ray.Direction;
+                    pdf = 1.0f;
+
+                    // Apply transmission strength ONLY (no albedo multiplication)
+                    throughput *= mat.Transmission;
+
+                    // Update ray for next bounce
+                    hitPoint = ray.GetHitPoint(hit.Distance) + worldDir * 0.001f;
+                    ray = new Ray(hitPoint, worldDir);
+                    prevTri = hit.TriIndex;
+                    bounce++;
+                    continue;
+                }
+            }
+
+        SurfaceInteraction:
+            // Handle transmissive materials (glass-like)
+            if (isTransmissive)
+            {
+                Vec3 incident = -ray.Direction; // Incident vector (points toward surface)
+                float cosi = Vec3.Dot(incident, shadingNormal); // Positive when entering
+                bool isEntering = cosi > 0;
+
+                // Determine IORs based on entering/exiting material
+                float etaI = isEntering ? currentIOR : mat.IOR;
+                float etaT = isEntering ? mat.IOR : currentIOR;
+                float eta = etaI / (etaT + 0.00001f);
+
+                // Calculate Fresnel reflection probability
+                float F0 = MathF.Pow((etaT - etaI) / (etaT + etaI + 0.00001f), 2);
+                float F_dielectric = F0 + (1 - F0) * MathF.Pow(1 - MathF.Abs(cosi), 5);
+
+                // Choose between reflection and refraction
+                float r = RandomFloat();
+                bool isReflection = r < F_dielectric;
+
+                if (isReflection)
+                {
+                    // Reflection direction
+                    worldDir = Vec3.Reflect(incident, shadingNormal);
+                }
+                else
+                {
+                    // Refraction direction (returns zero on TIR)
+                    worldDir = Refract(incident, shadingNormal, eta);
+                    if (worldDir.LengthSquared() < 1e-5f)
+                    {
+                        // Total internal reflection - fallback to reflection
+                        worldDir = Vec3.Reflect(incident, shadingNormal);
+                        isReflection = true;
+                    }
+                    else
+                    {
+                        // Update current IOR for next bounce when exiting
+                        currentIOR = isEntering ? mat.IOR : 1.0f;
+                    }
+                }
+
+                // Calculate outgoing cosine
+                float cosThetaOut = isReflection ?
+                    float.Abs(cosi) :
+                    float.Abs(Vec3.Dot(worldDir, shadingNormal));
+
+                // Apply solid angle scaling factor for refraction
+
+                Vec3 brdfAttenuation = Vec3.One;
+                if (!isReflection)
+                {
+                    // For refraction, apply albedo tint
+                    brdfAttenuation = albedo.AsVector3();
+                }
+
+                // Apply solid angle scaling factor for refraction
+                if (!isReflection)
+                {
+                    brdfAttenuation *= (etaI * etaI) / (etaT * etaT + 1e-6f);
+                }
+
+
+                // Update PDF and throughput
+                pdf = isReflection ? F_dielectric : (1 - F_dielectric);
+                throughput *= brdfAttenuation * cosThetaOut / (pdf + 1e-6f);
+
+                // Adjust hit point to prevent self-intersection
+                hitPoint = ray.GetHitPoint(hit.Distance) + worldDir * 0.001f;
+            }
+
+            // Sample warping for specular materials
+            if (roughness < 0.3f && metallic > 0.5f)
+            {
+                Vec2 r = Random2();
+                float warpFactor = (1.0f - roughness * 2.0f) + 0.00001f;
+
+                if (r.X < warpFactor)
+                {
+                    // Warped GGX sampling
+                    Vec3 halfVector = SampleGGX(r.X / warpFactor, r.Y, roughness, shadingNormal, tangent, bitangent);
+                    worldDir = Vec3.Reflect(ray.Direction, halfVector);
+
+                    // Calculate PDF for warped sampling
+                    float NdotV = float.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+                    float NdotL = float.Max(0, Vec3.Dot(shadingNormal, worldDir));
+                    float NdotH = float.Max(0, Vec3.Dot(shadingNormal, halfVector));
+
+                    // NEW: Specular-aware F0 calculation
+                    Vec3 F0 = CalculateF0(mat, albedo.AsVector3(), metallic);
+
+                    Vec3 F = FresnelSchlick(float.Max(0, Vec3.Dot(halfVector, -ray.Direction)), F0);
+                    float D = DistributionGGX(NdotH, roughness);
+                    pdf = (D * NdotH) / (4 * float.Max(1e-8f, Vec3.Dot(-ray.Direction, halfVector)));
+                    brdf = F * D / (4 * NdotV * NdotL + 1e-8f);
+                }
+                else
+                {
+                    // Fallback to cosine sampling
+                    float r1 = r.X / ((1 - warpFactor) + 0.00001f);
+                    float r2 = r.Y;
+                    float cosTheta = float.Sqrt(1 - r2);
+                    float sinTheta = float.Sqrt(r2);
+                    float phi = 2 * float.Pi * r1;
 
                     Vec3 localDir = new Vec3(
-                        MathF.Cos(phi) * sinTheta,
-                        MathF.Sin(phi) * sinTheta,
+                        float.Cos(phi) * sinTheta,
+                        float.Sin(phi) * sinTheta,
                         cosTheta
                     );
 
                     worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
                     pdf = cosTheta / MathF.PI;
 
-                    // BRDF evaluation
-                    float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
-                    float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
+                    // NEW: Specular-aware F0 calculation
+                    Vec3 F0 = CalculateF0(mat, albedo.AsVector3(), metallic);
+
+                    // Standard BRDF evaluation
+                    float NdotV = float.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+                    float NdotL = float.Max(0, Vec3.Dot(shadingNormal, worldDir));
                     Vec3 halfVec = Vec3.Normalize(-ray.Direction + worldDir);
-                    float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
-                    Vec3 F0 = Vec3.Lerp(new Vec3(0.04f), albedo.AsVector3(), metallic);
-                    Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
+                    float NdotH = float.Max(0, Vec3.Dot(shadingNormal, halfVec));
+                    Vec3 F = FresnelSchlick(float.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
                     float D = DistributionGGX(NdotH, roughness);
                     float G = GeometrySmith(NdotV, NdotL, roughness);
                     Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
                     Vec3 kS = F;
                     Vec3 kD = (Vec3.One - kS) * (1 - metallic);
-                    Vec3 diffuse = kD * albedo.AsVector3() / MathF.PI;
+                    Vec3 diffuse = kD * albedo.AsVector3() / float.Pi;
                     brdf = diffuse + specular;
                 }
+            }
+            else
+            {
+                // Standard sampling for non-specular materials
+                float r1 = RandomFloat();
+                float r2 = RandomFloat();
+                float cosTheta = float.Sqrt(1 - r2);
+                float sinTheta = float.Sqrt(r2);
+                float phi = 2 * float.Pi * r1;
 
-                // Update throughput with BRDF and PDF
-                float cosThetaOut = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
-                Vec3 newThroughput = throughput * brdf * cosThetaOut / pdf;
+                Vec3 localDir = new Vec3(
+                    float.Cos(phi) * sinTheta,
+                    float.Sin(phi) * sinTheta,
+                    cosTheta
+                );
 
+                worldDir = localDir.X * tangent + localDir.Y * bitangent + localDir.Z * shadingNormal;
+                pdf = cosTheta / float.Pi;
+
+                // NEW: Specular-aware F0 calculation
+                Vec3 F0 = CalculateF0(mat, albedo.AsVector3(), metallic);
+
+                // BRDF evaluation
+                float NdotV = Math.Max(0, Vec3.Dot(shadingNormal, -ray.Direction));
+                float NdotL = Math.Max(0, Vec3.Dot(shadingNormal, worldDir));
+                Vec3 halfVec = Vec3.Normalize(-ray.Direction + worldDir);
+                float NdotH = Math.Max(0, Vec3.Dot(shadingNormal, halfVec));
+                Vec3 F = FresnelSchlick(Math.Max(0, Vec3.Dot(halfVec, -ray.Direction)), F0);
+                float D = DistributionGGX(NdotH, roughness);
+                float G = GeometrySmith(NdotV, NdotL, roughness);
+                Vec3 specular = (F * D * G) / (4 * NdotV * NdotL + 0.001f);
+                Vec3 kS = F;
+                Vec3 kD = (Vec3.One - kS) * (1 - metallic);
+                Vec3 diffuse = kD * albedo.AsVector3() / float.Pi;
+                brdf = diffuse + specular;
+            }
+
+            // Apply alpha attenuation to surface interactions
+            if (mat.AlphaBlendMode == AlphaBlendMode.Blend && alpha < 0.999f)
+            {
+                throughput *= alpha;
+            }
+
+            {
                 // Energy-based path termination
+                float cosThetaOut = MathF.Max(1e-5f, Vec3.Dot(shadingNormal, worldDir));
+                Vec3 newThroughput = throughput * brdf * cosThetaOut / (pdf + 1e-6f);
                 float newLuminance = Luminance(newThroughput);
                 if (pathLuminance + newLuminance > MaxPathLuminance)
                 {
@@ -323,36 +458,28 @@ sealed partial class BVHRaytracer : IRenderer
                 throughput = newThroughput;
                 pathLuminance += newLuminance;
                 ray = new Ray(hitPoint, worldDir);
-            }
-            else
-            {
-                ray = new Ray(ray.GetHitPoint(hit.Distance), 0.001f, ray.Direction, float.MaxValue);
-            }
-            // Update ray for next bounce
-            prevTri = hit.TriIndex;
+                prevTri = hit.TriIndex;
+                bounce++;
 
-            // Improved Russian Roulette with firefly prevention
-            if (bounce > 2)
-            {
-                float throughputLum = Luminance(throughput);
-                float q = Math.Max(0.05f, 1 - throughputLum);
-
-                // More aggressive termination for bright paths
-                if (throughputLum > 10f)
+                // Russian Roulette termination
+                if (bounce > 2)
                 {
-                    q = Math.Min(q * 1.5f, 0.99f);
+                    float throughputLum = Luminance(throughput);
+                    float q = Math.Max(0.05f, 1 - throughputLum);
+                    if (throughputLum > 10f)
+                    {
+                        q = Math.Min(q * 1.5f, 0.99f);
+                    }
+                    if (RandomFloat() < q)
+                    {
+                        break;
+                    }
+                    throughput /= ((1 - q) + 0.00001f);
                 }
-
-                if (RandomFloat() < q)
-                {
-                    break;
-                }
-
-                throughput /= (1 - q);
             }
         }
 
-        // Final firefly clamp for the entire path
+        // Final firefly clamp
         float radianceLum = Luminance(radiance);
         if (radianceLum > FireflyClampThreshold)
         {
@@ -362,6 +489,29 @@ sealed partial class BVHRaytracer : IRenderer
         return radiance;
     }
 
+    static Vec3 Refract(Vec3 I, Vec3 N, float eta)
+    {
+        float cosi = Math.Clamp(Vec3.Dot(I, N), -1, 1);
+        float k = 1 - eta * eta * (1 - cosi * cosi);
+        if (k < 0) return Vec3.Zero;
+        return eta * I - (eta * cosi + MathF.Sqrt(k)) * N;
+    }
+    static Vec3 CalculateF0(Material mat, Vec3 albedoColor, float metallic)
+    {
+        // For high IOR materials (specular-glossiness workflow)
+        if (mat.IOR > 100f)
+        {
+            // Calculate Fresnel reflectance at normal incidence
+            float f0 = (mat.IOR - 1) / (mat.IOR + 1);
+            f0 = f0 * f0;  // Square for Fresnel reflectance
+
+            // Apply specular factor tint
+            return mat.SpecularFactor * f0;
+        }
+
+        // Standard metallic workflow
+        return Vec3.Lerp(new Vec3(0.04f), albedoColor, metallic);
+    }
     static float Luminance(Vec3 c)
     {
         float lum = 0.2126f * c.X + 0.7152f * c.Y + 0.0722f * c.Z;
@@ -413,9 +563,14 @@ sealed partial class BVHRaytracer : IRenderer
     {
         Vec3 tangent;
         if (MathF.Abs(normal.X) > MathF.Abs(normal.Y))
+        {
             tangent = Vec3.Normalize(new Vec3(normal.Z, 0, -normal.X));
+        }
         else
+        {
             tangent = Vec3.Normalize(new Vec3(0, -normal.Z, normal.Y));
+        }
+
         return tangent;
     }
 

@@ -1,6 +1,7 @@
 using OpenTK.Mathematics;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using VBeamRT.Raytracing.CPU.PathTracing.BVH;
@@ -113,13 +114,22 @@ public sealed class Image
         return _data[y * Width + x];
     }
 }
+public enum AlphaBlendMode
+{
+    None,
+    Clip,
+    Blend
+}
+
 public struct Material
 {
     public Vec4 Albedo;
     public Vec3 Emission;
+    public Vec3 SpecularFactor;
+    public AlphaBlendMode AlphaBlendMode;
     public float Roughness;
     public float Metallic;
-    public float IOR; // Index of Refraction
+    public float IOR;
     public float Transmission;
     public int AlbedoTextureId;
     public int EmissionTextureId;
@@ -241,8 +251,9 @@ public static class GltfLoader
             Emission = Vec3.Zero,
             Roughness = 1.0f,
             Metallic = 0.0f,
-            IOR = 1.5f,
-            Transmission = 0.0f,
+            IOR = 1.0f,
+            AlphaBlendMode = AlphaBlendMode.None,
+            Transmission = 1.0f,
             AlbedoTextureId = -1,
             NormalTextureId = -1,
             MetallicRoughnessTextureId = -1
@@ -257,14 +268,18 @@ public static class GltfLoader
                 Emission = Vec3.Zero,
                 Roughness = 1.0f,
                 Metallic = 0.0f,
-                IOR = 1.5f,
-                Transmission = 0.0f,
+                IOR = 1.0f,
+                Transmission = 1.0f,
+                AlphaBlendMode = AlphaBlendMode.None,
                 AlbedoTextureId = -1,
                 NormalTextureId = -1,
                 EmissionTextureId = -1,
                 MetallicRoughnessTextureId = -1
             };
-
+            if (mat.TryGetProperty("name", out var name) && name.GetString() == "forMayaAOlambert17")
+            {
+                Console.WriteLine();
+            }
             // PBR metallic-roughness parameters
             if (mat.TryGetProperty("pbrMetallicRoughness", out var pbr))
             {
@@ -274,7 +289,7 @@ public static class GltfLoader
                         baseColor[0].GetSingle(),
                         baseColor[1].GetSingle(),
                         baseColor[2].GetSingle(),
-                        1
+                        baseColor[3].GetSingle()
                     );
                 }
 
@@ -295,6 +310,23 @@ public static class GltfLoader
                     material.MetallicRoughnessTextureId = MetallicRoughnessTexture.GetProperty("index").GetInt32();
                 }
             }
+            if (mat.TryGetProperty("alphaMode", out var alphaMode))
+            {
+                var am = alphaMode.GetString();
+                if (am == "OPAQUE")
+                {
+                    material.AlphaBlendMode = AlphaBlendMode.None;
+                }
+                else if (am == "MASK")
+                {
+                    material.AlphaBlendMode = AlphaBlendMode.Clip;
+                }
+                else
+                {
+                    material.AlphaBlendMode = AlphaBlendMode.Blend;
+                }
+            }
+
             if (mat.TryGetProperty("normalTexture", out var normalTexture))
             {
                 material.NormalTextureId = normalTexture.GetProperty("index").GetInt32();
@@ -326,6 +358,68 @@ public static class GltfLoader
                 if (extensions.TryGetProperty("KHR_materials_ior", out var iorExt))
                 {
                     material.IOR = iorExt.GetProperty("ior").GetSingle();
+                }
+
+                if (extensions.TryGetProperty("KHR_materials_pbrSpecularGlossiness", out var pbrSpecGlossExt))
+                {
+                    if (pbrSpecGlossExt.TryGetProperty("diffuseFactor", out var diffuse))
+                    {
+                        material.Albedo = new(
+                            diffuse[0].GetSingle(),
+                            diffuse[1].GetSingle(),
+                            diffuse[2].GetSingle(),
+                            diffuse[3].GetSingle());
+                    }
+                    else
+                    {
+                        material.Albedo = new(1);
+                    }
+
+                    if (pbrSpecGlossExt.TryGetProperty("diffuseTexture", out var albedoTexture))
+                    {
+                        material.AlbedoTextureId = albedoTexture.GetProperty("index").GetInt32();
+                    }
+
+                    if (pbrSpecGlossExt.TryGetProperty("glossinessFactor", out var gloss))
+                    {
+                        material.Roughness = 1f - gloss.GetSingle();
+                    }
+                    else
+                    {
+                        material.Roughness = 0;
+                    }
+
+                    Vec3 specFactor;
+                    if (pbrSpecGlossExt.TryGetProperty("specularFactor", out var spec))
+                    {
+                        specFactor = new(
+                            spec[0].GetSingle(),
+                            spec[1].GetSingle(),
+                            spec[2].GetSingle());
+                    }
+                    else
+                    {
+                        specFactor = new(1);
+                    }
+
+
+                    // BLENDER'S APPROACH: Always set IOR to 1000
+                    material.IOR = 1000f;
+
+                    // Store specular factor as a separate material property
+                    material.SpecularFactor = specFactor;
+
+                    // For metallic workflow conversion:
+                    // Use diffuse as base color, and specular factor as F0 tint
+                    material.Metallic = 0.0f; // Treat as dielectric initially
+
+                    // For materials with black diffuse and white specular, treat as metal
+                    if (material.Albedo.AsVector3().LengthSquared() < 0.01f &&
+                        specFactor.LengthSquared() > 0.9f)
+                    {
+                        material.Metallic = 1.0f;
+                        material.Albedo = new Vec4(specFactor, material.Albedo.W);
+                    }
                 }
             }
 

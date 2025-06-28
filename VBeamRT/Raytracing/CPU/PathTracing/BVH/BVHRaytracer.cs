@@ -1,11 +1,14 @@
 using OpenTK.Mathematics;
 using OpenTK.Platform;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using VBeamRT.Raytracing.CPU.Common;
 using VKGraphics;
+using static OpenTK.Platform.Native.macOS.MacOSCursorComponent;
 
 namespace VBeamRT.Raytracing.CPU.PathTracing.BVH;
 
@@ -27,13 +30,14 @@ sealed partial class BVHRaytracer : IRenderer
     GltfScene scene;
     readonly Triangle[] triangles;
     readonly Vertex[] vertices;
-
+    public Vector2i Res;
 #pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
     public BVHRaytracer(Game game)
 #pragma warning restore CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
     {
         _game = game;
-        scene = GltfLoader.Load("Models/Beta map split.glb");
+        scene = GltfLoader.Load("Models/alfa_romeo_stradale_1967.glb");
+        //scene = GltfLoader.Load("Models/Beta map split.glb");
         vertices = [.. scene.Vertices];
         triangles = [.. scene.Triangles];
         BVH = new BVH(vertices, triangles);
@@ -76,26 +80,22 @@ sealed partial class BVHRaytracer : IRenderer
         _cl = _rf.CreateCommandList();
     }
 
-    void ResizeGPU(int resX, int resY)
-    {
-        _mainTex?.Dispose();
-        _mainTex = _rf.CreateTexture(new TextureDescription((uint)resX, (uint)resY,
-            1, 1, 1, PixelFormat.R32G32B32A32Float, TextureUsage.Sampled | TextureUsage.Storage, TextureType.Texture2D));
-        _blitSet?.Dispose();
-        _blitSet = _rf.CreateResourceSet(new ResourceSetDescription(_blitLayout, _gd.LinearSampler, _mainTex));
-        _swapchain.Resize((uint)resX, (uint)resY);
-    }
-
     void ResizeCPU(int resX, int resY)
     {
         Console.WriteLine($"Resized to: {resX} by {resY}");
         _linearAccumulationBuffer = new Vec3[resX * resY];
         _imageBuffer = new Vector4[resX * resY];
+        Res = new(resX, resY);
         _frameCount = 0;
+        _mainTex?.Dispose();
+        _mainTex = _rf.CreateTexture(new TextureDescription((uint)Res.X, (uint)Res.Y,
+            1, 1, 1, PixelFormat.R32G32B32A32Float, TextureUsage.Sampled | TextureUsage.Storage, TextureType.Texture2D));
+        _blitSet?.Dispose();
+        _blitSet = _rf.CreateResourceSet(new ResourceSetDescription(_blitLayout, _gd.LinearSampler, _mainTex));
     }
-
     public void Update()
     {
+   
         if (_game.Input.KeyPressed(Scancode.F11))
         {
             if (Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) == WindowMode.WindowedFullscreen)
@@ -107,20 +107,36 @@ sealed partial class BVHRaytracer : IRenderer
                 Toolkit.Window.SetMode(_game.MainWindowInfo.Handle, WindowMode.WindowedFullscreen);
             }
         }
+
         Toolkit.Window.GetFramebufferSize(_game.MainWindowInfo.Handle, out var framebufferSize);
-        if (_linearAccumulationBuffer == null || framebufferSize.X * framebufferSize.Y != _linearAccumulationBuffer.Length)
+
+        if (_linearAccumulationBuffer == null
+            || _game.Input.KeyPressed(Scancode.R)
+            && framebufferSize.X * framebufferSize.Y != _linearAccumulationBuffer.Length)
         {
             ResizeCPU(framebufferSize.X, framebufferSize.Y);
         }
-        if (_mainTex == null || _mainTex.Width != framebufferSize.X || _mainTex.Height != framebufferSize.Y)
+        if ((_mainTex == null || _mainTex.Width != framebufferSize.X || _mainTex.Height != framebufferSize.Y)
+            && Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) != WindowMode.Hidden)
         {
-            if (Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) != WindowMode.Hidden)
-            {
-                ResizeGPU(framebufferSize.X, framebufferSize.Y);
-            }
+            _swapchain.Resize((uint)framebufferSize.X, (uint)framebufferSize.Y);
         }
-        RenderScene(framebufferSize.X, framebufferSize.Y);
-        BlitImage(framebufferSize.X, framebufferSize.Y);
+        RenderScene(Res.X, Res.Y);
+        BlitImage(Res.X, Res.Y);
+        if (_game.Input.KeyPressed(Scancode.P))
+        {
+            Image<RgbaVector> img = new(framebufferSize.X, framebufferSize.Y);
+            img.ProcessPixelRows(a =>
+            {
+                for (int y = 0; y < framebufferSize.Y; y++)
+                {
+                    var destSpan = a.GetRowSpan(framebufferSize.Y - (y + 1));
+                    MemoryMarshal.Cast<Vector4, RgbaVector>(_imageBuffer.AsSpan(framebufferSize.X * y, framebufferSize.X)).CopyTo(destSpan);
+                }
+
+            });
+            img.SaveAsPng("Output.png");
+        }
     }
 
 
@@ -152,11 +168,12 @@ sealed partial class BVHRaytracer : IRenderer
     void RenderScene(int xPixels, int yPixels)
     {
 
-        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 125 + Vec3.UnitX * 30 + Vec3.UnitZ * -80, Vec3.UnitX + Vec3.UnitZ*0.5f, Vec3.UnitY);
+        //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 115 + Vec3.UnitX * 64 + Vec3.UnitZ * -65, Vec3.UnitX + Vec3.UnitZ * 0.5f, Vec3.UnitY);
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 8 + Vec3.UnitZ * 35 + Vec3.UnitZ * 1, -Vec3.UnitZ, Vec3.UnitY);
 
 
         var projectionMatrix = Matrix4x4.CreatePerspectiveFieldOfView(
-            60 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
+            40 * ToRadians, xPixels / (float)yPixels, 0.01f, 1000f);
         Matrix4x4.Invert(projectionMatrix, out var inverseProjectionMatrix);
         Matrix4x4.Invert(viewMatrix, out var inverseViewMatrix);
         _frameCount++;
@@ -266,17 +283,6 @@ sealed partial class BVHRaytracer : IRenderer
         return ray;
     }
 
-    static Vec3 ClampFirefly(Vec3 sample, Vec3 mean, float maxRelative)
-    {
-        Vec3 ratio = sample / mean;
-        float maxRatio = Math.Max(ratio.X, Math.Max(ratio.Y, ratio.Z));
-
-        if (maxRatio > maxRelative)
-        {
-            return mean + (sample - mean) * (maxRelative / maxRatio);
-        }
-        return sample;
-    }
 
     static Vec3 Aces(Vec3 v)
     {
