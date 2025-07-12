@@ -154,7 +154,7 @@ public enum LightType
 }
 public sealed class GltfScene
 {
-    public List<PrimitiveData> Primitives = [];
+    public List<Primitive> Primitives = [];
     public List<Vertex> Vertices = [];
     public List<Triangle> Triangles = [];
     public List<Material> Materials = [];
@@ -177,11 +177,11 @@ public readonly struct TextureUse
     }
 }
 
-public struct PrimitiveData
+public struct Primitive
 {
     public int MaterialIndex;
 
-    public PrimitiveData(int materialIndex)
+    public Primitive(int materialIndex)
     {
         MaterialIndex = materialIndex;
     }
@@ -669,7 +669,7 @@ public static class GltfLoader
                 PrimIndex = scene.Primitives.Count
             });
         }
-        scene.Primitives.Add(new PrimitiveData(materialIndex));
+        scene.Primitives.Add(new Primitive(materialIndex));
 
     }
 
