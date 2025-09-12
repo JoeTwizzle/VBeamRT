@@ -3,12 +3,9 @@ using OpenTK.Platform;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using System.Numerics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
 using VBeamRT.Raytracing.CPU.Common;
 using VKGraphics;
-using static OpenTK.Platform.Native.macOS.MacOSCursorComponent;
 
 namespace VBeamRT.Raytracing.CPU.PathTracing.BVH;
 
@@ -55,7 +52,7 @@ sealed partial class BVHRaytracer : IRenderer
             true, null, false, ResourceBindingModel.Improved, true, false));
         _rf = _gd.ResourceFactory;
         _swapchain = _rf.CreateSwapchain(new SwapchainDescription(
-            _game.MainWindowInfo.Handle, 800, 600, null, false));
+            _game.MainWindowInfo.Handle, 1600 / 2, 900 / 2, null, false));
     }
 
     void SetupBlitPass()
@@ -95,7 +92,7 @@ sealed partial class BVHRaytracer : IRenderer
     }
     public void Update()
     {
-   
+
         if (_game.Input.KeyPressed(Scancode.F11))
         {
             if (Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) == WindowMode.WindowedFullscreen)
@@ -116,7 +113,7 @@ sealed partial class BVHRaytracer : IRenderer
         {
             ResizeCPU(framebufferSize.X, framebufferSize.Y);
         }
-        if ((_mainTex == null || _mainTex.Width != framebufferSize.X || _mainTex.Height != framebufferSize.Y)
+        if ((_mainTex == null || _swapchain.Framebuffer.Width != framebufferSize.X || _swapchain.Framebuffer.Height != framebufferSize.Y)
             && Toolkit.Window.GetMode(_game.MainWindowInfo.Handle) != WindowMode.Hidden)
         {
             _swapchain.Resize((uint)framebufferSize.X, (uint)framebufferSize.Y);
@@ -169,7 +166,7 @@ sealed partial class BVHRaytracer : IRenderer
     {
         //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 75 + Vec3.UnitX * 10 + Vec3.UnitZ * -50, Vec3.UnitX + Vec3.UnitZ, Vec3.UnitY);
 
-        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 115 + Vec3.UnitX * 64 + Vec3.UnitZ * -65, Vec3.UnitX + Vec3.UnitZ * 0.5f, Vec3.UnitY);
+        var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 112 + Vec3.UnitX * 90 + Vec3.UnitZ * -65, -Vec3.UnitX + Vec3.UnitZ * 0.5f, Vec3.UnitY);
         //var viewMatrix = Matrix4x4.CreateLookTo(Vec3.UnitY * 8 + Vec3.UnitZ * 35 + Vec3.UnitZ * 1, -Vec3.UnitZ, Vec3.UnitY);
 
 
@@ -327,9 +324,10 @@ sealed partial class BVHRaytracer : IRenderer
         _blitSet.Dispose();
         _blitPipeline.Dispose();
         _blitLayout.Dispose();
+        _gd.WaitForIdle();
+        _swapchain.Dispose();
         _mainTex.Dispose();
         _cl.Dispose();
-        _swapchain.Dispose();
         _gd.Dispose();
     }
 }

@@ -147,11 +147,11 @@ public sealed partial class BVH
         flatBVH = [.. list];
     }
 
-    private const int BinCount = 16;  // Increased for better SAH quality
+    private const int BinCount = 32;  // Increased for better SAH quality
     private const int LeafThreshold = 8;  // Increased leaf size
     private const int MaxDepth = 64;
     private const float TraversalCost = 1.0f;  // Explicit traversal cost
-    private const float IntersectionCost = 2.0f;  // Explicit intersection cost
+    private const float IntersectionCost = 3.0f;  // Explicit intersection cost
 
     struct BinInfo
     {
